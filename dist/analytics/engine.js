@@ -17,6 +17,7 @@ export class AnalyticsEngine {
     constructor(db) {
         this.db = db;
         this.ts = new TimeSeriesStore(db);
+        this.bootstrap();
         bus.on('trade:executed', (t) => {
             this.realized += t.edge * t.size;
             if (t.edge > 0)
@@ -38,6 +39,37 @@ export class AnalyticsEngine {
             this.db.db.prepare('INSERT INTO edge_observations(ts, market_id, outcome, model_prob, market_prob, edge, slippage) VALUES(?,?,?,?,?,?,?)')
                 .run(Date.now(), s.marketId, s.outcome, s.probability, s.price, s.edge, 0);
         });
+    }
+    bootstrap() {
+        // Load historical trades to compute realized P&L, wins, losses
+        const trades = this.db.db.prepare('SELECT * FROM trades ORDER BY ts ASC').all();
+        for (const t of trades) {
+            const edge = t.edge ?? 0;
+            const size = t.size ?? 0;
+            if (t.status === 'matched' || t.status === 'MATCHED' || t.status === 'filled' || t.status === 'delayed') {
+                this.realized += edge / 100 * size; // edge is percentage
+                if (edge > 0)
+                    this.wins++;
+                else
+                    this.losses++;
+                const equity = 1000 + this.realized + this.unrealized;
+                this.equityCurve.push(equity);
+                const prev = this.equityCurve[this.equityCurve.length - 2] ?? 1000;
+                const ret = prev > 0 ? (equity - prev) / prev : 0;
+                this.returns.push(ret);
+            }
+        }
+        // Load positions for unrealized P&L
+        const positions = this.db.db.prepare('SELECT * FROM positions WHERE resolved=0').all();
+        for (const p of positions) {
+            this.unrealized += (p.unrealized_pnl ?? 0);
+        }
+        // Load redemptions into realized
+        const redemptions = this.db.db.prepare('SELECT SUM(amount) as total FROM redemptions').get();
+        if (redemptions?.total) {
+            // Already accounted in trades, just note it
+        }
+        console.log(`Analytics bootstrapped: ${trades.length} trades, ${this.wins}W/${this.losses}L, realized=$${this.realized.toFixed(2)}, unrealized=$${this.unrealized.toFixed(2)}`);
     }
     update() {
         const equity = 1000 + this.realized + this.unrealized;
