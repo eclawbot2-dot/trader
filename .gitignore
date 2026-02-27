@@ -1,1 +1,13 @@
-node_modules/\ndist/\nfrontend/node_modules/\nfrontend/dist/\n*.log\n.env\n.wallet.json\n.api-creds.json\n.notify-sent\n.notify.lock\npoly-edge.db\n
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+*.log
+.env
+.wallet.json
+.api-creds.json
+.notify-sent
+.notify.lock
+polyedge.db
+polyedge.db-wal
+polyedge.db-shm

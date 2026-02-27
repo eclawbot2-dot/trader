@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: poly-edge-v2
+    runtime: node
+    plan: free
+    buildCommand: npm install && npx tsc -p tsconfig.json && cd frontend && npm install && npx vite build
+    startCommand: NODE_ENV=production PORT=10000 node dist/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_TLS_REJECT_UNAUTHORIZED
+        value: "0"
+      - fromGroup: poly-edge-secrets
+    disk:
+      name: polyedge-data
+      mountPath: /data
+      sizeGB: 1
+
+envVarGroups:
+  - name: poly-edge-secrets
+    envVars:
+      - key: PREDICTIONDATA_API_KEY
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+      - key: ALCHEMY_RPC
+        sync: false
