@@ -176,10 +176,10 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
       .prepare('SELECT ts, market_id, outcome, edge, settled, correct FROM edge_observations ORDER BY ts DESC LIMIT 800')
       .all();
 
-    // Real trade stats from DB (only counts, not financial values)
-    const tradeStats = db.db.prepare("SELECT status, COUNT(*) as cnt FROM trades GROUP BY status").all() as any[];
-    const matchedCount = tradeStats.filter((s: any) => ['matched', 'filled', 'delayed'].includes(s.status)).reduce((a: number, s: any) => a + s.cnt, 0);
-    const failedCount = tradeStats.find((s: any) => s.status === 'FAILED')?.cnt || 0;
+    // Deduplicated trade stats — migration duplicated all v1 trades
+    const matchedCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side FROM trades WHERE status IN ('matched','filled','delayed'))").get() as any)?.c || 0;
+    const failedCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side FROM trades WHERE status = 'FAILED')").get() as any)?.c || 0;
+    const totalUniqueCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side, price, size, edge, status FROM trades)").get() as any)?.c || 0;
 
     res.json({
       positions: enrichedPositions,
@@ -199,7 +199,7 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
         redemptions: onChain.redemptions,
         ts: onChain.ts,
       } : null,
-      tradeStats: { matched: matchedCount, failed: failedCount, total: trades.length },
+      tradeStats: { matched: matchedCount, failed: failedCount, total: totalUniqueCount },
       equityCurve: db.getTimeSeries('equity', 1000),
       drawdownSeries: db.getTimeSeries('drawdown', 1000),
       edgeObservations,

@@ -355,7 +355,7 @@ export default function App() {
                 <MetricCard label="CLOB Returns" value={clobReturns} prefix="$" detail="Cancelled/returned orders" />
                 <MetricCard label="ROI" value={totalDeposited > 0 ? (netPnl / totalDeposited) * 100 : 0} suffix="%" colorize />
                 <MetricCard label="Open Positions" value={positions.filter((p: any) => p.on_chain_tokens > 0).length} onClick={() => setTab('positions')} detail={`${positions.length} in DB`} />
-                <MetricCard label="On-Chain TXs" value={934} detail="Polygon transactions" />
+                <MetricCard label="On-Chain TXs" value={(oc?.deposits?.length ?? 0) + (oc?.redemptions?.length ?? 0)} detail="Deposits + redemptions verified" onClick={() => window.open(`https://polygonscan.com/address/${WALLET}`, '_blank')} />
               </div>
 
               {/* Recent Trades Preview */}
@@ -399,36 +399,31 @@ export default function App() {
                   <table className="w-full text-xs sm:text-sm">
                     <thead><tr className="text-[10px] uppercase tracking-wider text-gray-500 border-b border-[#1e293b]">
                       <th className="text-left py-2 px-2 sm:px-3">Team</th><th className="text-left py-2 px-2 sm:px-3 hidden md:table-cell">Game</th>
-                      <th className="text-right py-2 px-2 sm:px-3">Shares</th><th className="text-right py-2 px-2 sm:px-3">Avg</th>
-                      <th className="text-right py-2 px-2 sm:px-3">Cost</th><th className="text-right py-2 px-2 sm:px-3">On-Chain</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Tokens (On-Chain)</th><th className="text-right py-2 px-2 sm:px-3">Avg Price</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Value</th>
                       <th className="text-right py-2 px-2 sm:px-3">Status</th><th className="text-right py-2 px-2 sm:px-3">Links</th>
                     </tr></thead>
                     <tbody>{positions.map((p: any, i: number) => {
                       const meta = parseMeta(p.meta);
-                      const cost = p.size * p.avg_price;
-                      const upnl = (p.size * p.last_price) - cost;
+                      const tokens = p.on_chain_tokens ?? 0;
+                      const value = tokens * p.avg_price;
                       return (
-                        <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors">
+                        <tr key={i} className={`border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors ${tokens === 0 ? 'opacity-40' : ''}`}>
                           <td className="py-2.5 px-2 sm:px-3 font-medium">
                             <a href={pmLink(p.market_id)} target="_blank" rel="noreferrer" className="hover:text-purple-400 transition-colors underline decoration-gray-700 hover:decoration-purple-400">{p.outcome || 'N/A'}</a>
                           </td>
                           <td className="py-2.5 px-2 sm:px-3 text-gray-500 text-[11px] max-w-[200px] truncate hidden md:table-cell">{meta.game || ''}</td>
-                          <td className="py-2.5 px-2 sm:px-3 text-right font-mono">{fmt(p.size, 0)}</td>
-                          <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(p.avg_price)}</td>
-                          <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(cost)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">
-                            {p.on_chain_tokens != null ? (
-                              <span className={p.on_chain_tokens > 0 ? 'text-emerald-400' : 'text-red-400'}>
-                                {fmt(p.on_chain_tokens, 1)}
-                              </span>
-                            ) : <span className="text-gray-600">—</span>}
+                            <span className={tokens > 0 ? 'text-emerald-400' : 'text-red-400'}>{fmt(tokens, 2)}</span>
+                            {tokens !== p.size && <span className="text-gray-600 text-[9px] ml-1">(DB: {p.size})</span>}
                           </td>
+                          <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(p.avg_price)}</td>
+                          <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(value)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right">
-                            {p.on_chain_tokens != null ? (
-                              p.on_chain_tokens > 0
-                                ? <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">✓ Verified</span>
-                                : <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-400">✗ Not on-chain</span>
-                            ) : <span className="text-[10px] text-gray-600">checking…</span>}
+                            {tokens > 0
+                              ? <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">✓ On-chain</span>
+                              : <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-400">✗ Settled/Redeemed</span>
+                            }
                           </td>
                           <td className="py-2.5 px-2 sm:px-3 text-right space-x-1.5">
                             <a href={pmLink(p.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>

@@ -26,7 +26,14 @@ export class Db {
         return this.db.prepare('SELECT * FROM positions ORDER BY market_id, outcome').all();
     }
     listTrades(limit = 200) {
-        return this.db.prepare('SELECT * FROM trades ORDER BY ts DESC LIMIT ?').all(limit);
+        // Deduplicate: migration doubled all v1 trades. Use MIN(id) to pick one per unique trade.
+        return this.db.prepare(`
+      SELECT t.* FROM trades t
+      INNER JOIN (
+        SELECT MIN(id) as id FROM trades GROUP BY ts, market_id, outcome, side, price, size, edge, status
+      ) dedup ON t.id = dedup.id
+      ORDER BY t.ts DESC LIMIT ?
+    `).all(limit);
     }
     recordBalance(ts, usdc, exposure, equity) {
         this.db.prepare('INSERT OR REPLACE INTO balances(ts, usdc, exposure, equity) VALUES(?,?,?,?)').run(ts, usdc, exposure, equity);

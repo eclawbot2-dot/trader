@@ -46,7 +46,14 @@ export class Db {
   }
 
   listTrades(limit = 200): unknown[] {
-    return this.db.prepare('SELECT * FROM trades ORDER BY ts DESC LIMIT ?').all(limit);
+    // Deduplicate: migration doubled all v1 trades. Use MIN(id) to pick one per unique trade.
+    return this.db.prepare(`
+      SELECT t.* FROM trades t
+      INNER JOIN (
+        SELECT MIN(id) as id FROM trades GROUP BY ts, market_id, outcome, side, price, size, edge, status
+      ) dedup ON t.id = dedup.id
+      ORDER BY t.ts DESC LIMIT ?
+    `).all(limit);
   }
 
   recordBalance(ts: number, usdc: number, exposure: number, equity: number): void {
