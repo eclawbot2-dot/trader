@@ -28,6 +28,9 @@ const truncAddr = (a: string) => a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '';
 const pnlColor = (v: number) => v > 0 ? 'text-emerald-400' : v < 0 ? 'text-red-400' : 'text-gray-400';
 const WALLET = '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe';
 const CTF = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+const isRealTxHash = (h: string | null) => h && h.length >= 64; // real tx hashes are 66 chars (0x + 64 hex)
+// Server-side slug resolver → redirects to polymarket.com/event/<slug>
+const pmLink = (tokenId: string) => `/pm/${tokenId}`;
 
 const parseMeta = (m: any) => {
   if (!m) return {};
@@ -302,7 +305,7 @@ export default function App() {
                         <td className="py-2 px-2 sm:px-3 text-right font-mono">{fmt(t.size)}</td>
                         <td className="py-2 px-2 sm:px-3 text-right font-mono text-blue-400">{fmt(t.edge)}%</td>
                         <td className="py-2 px-2 sm:px-3 text-right"><span className={`text-[10px] px-1.5 py-0.5 rounded-full ${t.status === 'matched' || t.status === 'filled' ? 'bg-emerald-500/20 text-emerald-400' : t.status === 'FAILED' ? 'bg-red-500/20 text-red-400' : 'bg-yellow-500/20 text-yellow-400'}`}>{t.status}</span></td>
-                        <td className="py-2 px-2 sm:px-3 text-right">{t.tx_hash ? <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">↗</a> : ''}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right">{isRealTxHash(t.tx_hash) ? <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">↗</a> : ''}</td>
                       </tr>
                     ))}</tbody>
                   </table>
@@ -328,19 +331,19 @@ export default function App() {
                       const meta = parseMeta(p.meta);
                       const cost = p.size * p.avg_price;
                       const upnl = (p.size * p.last_price) - cost;
-                      // Build Polymarket search link from team name
-                      const pmSearch = encodeURIComponent(p.outcome || '');
                       return (
                         <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors">
-                          <td className="py-2.5 px-2 sm:px-3 font-medium">{p.outcome || 'N/A'}</td>
+                          <td className="py-2.5 px-2 sm:px-3 font-medium">
+                            <a href={pmLink(p.market_id)} target="_blank" rel="noreferrer" className="hover:text-purple-400 transition-colors underline decoration-gray-700 hover:decoration-purple-400">{p.outcome || 'N/A'}</a>
+                          </td>
                           <td className="py-2.5 px-2 sm:px-3 text-gray-500 text-[11px] max-w-[200px] truncate hidden md:table-cell">{meta.game || ''}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">{fmt(p.size, 0)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(p.avg_price)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(cost)}</td>
                           <td className={`py-2.5 px-2 sm:px-3 text-right font-bold font-mono ${pnlColor(upnl)}`}>{fmtUsd(upnl)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right space-x-1.5">
-                            <a href={`https://polymarket.com/search?query=${pmSearch}`} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Polymarket ↗</a>
-                            <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">On-Chain ↗</a>
+                            <a href={pmLink(p.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
+                            <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">Wallet ↗</a>
                           </td>
                         </tr>
                       );
@@ -368,11 +371,12 @@ export default function App() {
                     </tr></thead>
                     <tbody>{trades.map((t: any, i: number) => {
                       const meta = parseMeta(t.meta);
-                      const pmSearch = encodeURIComponent(t.outcome || '');
                       return (
                         <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors">
                           <td className="py-2 px-2 sm:px-3 text-gray-400 font-mono text-[11px] whitespace-nowrap">{fmtSmartDate(t.ts)}</td>
-                          <td className="py-2 px-2 sm:px-3 font-medium whitespace-nowrap">{t.outcome || 'N/A'}</td>
+                          <td className="py-2 px-2 sm:px-3 font-medium whitespace-nowrap">
+                            <a href={pmLink(t.market_id)} target="_blank" rel="noreferrer" className="hover:text-purple-400 transition-colors underline decoration-gray-700 hover:decoration-purple-400">{t.outcome || 'N/A'}</a>
+                          </td>
                           <td className="py-2 px-2 sm:px-3 text-gray-500 text-[11px] max-w-[200px] truncate hidden lg:table-cell">{meta.game || ''}</td>
                           <td className={`py-2 px-2 sm:px-3 text-right font-semibold ${t.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}`}>{t.side}</td>
                           <td className="py-2 px-2 sm:px-3 text-right font-mono">{fmt(t.price)}</td>
@@ -380,8 +384,8 @@ export default function App() {
                           <td className="py-2 px-2 sm:px-3 text-right font-mono text-blue-400">{fmt(t.edge)}%</td>
                           <td className="py-2 px-2 sm:px-3 text-right"><span className={`text-[10px] px-1.5 py-0.5 rounded-full ${t.status === 'matched' || t.status === 'filled' ? 'bg-emerald-500/20 text-emerald-400' : t.status === 'FAILED' ? 'bg-red-500/20 text-red-400' : 'bg-yellow-500/20 text-yellow-400'}`}>{t.status}</span></td>
                           <td className="py-2 px-2 sm:px-3 text-right space-x-1">
-                            {t.tx_hash && <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">TX ↗</a>}
-                            <a href={`https://polymarket.com/search?query=${pmSearch}`} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
+                            {isRealTxHash(t.tx_hash) && <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">TX ↗</a>}
+                            <a href={pmLink(t.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
                           </td>
                         </tr>
                       );
@@ -412,7 +416,7 @@ export default function App() {
                         <td className="py-2 px-2 sm:px-3 font-medium text-xs">{r.market_id}</td>
                         <td className="py-2 px-2 sm:px-3 text-right font-mono text-emerald-400 font-bold">${fmt(r.amount)}</td>
                         <td className="py-2 px-2 sm:px-3 text-right">
-                          {r.tx_hash && <a href={`https://polygonscan.com/tx/${r.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 font-mono text-[10px] underline">{r.tx_hash.slice(0, 10)}… ↗</a>}
+                          {isRealTxHash(r.tx_hash) ? <a href={`https://polygonscan.com/tx/${r.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 font-mono text-[10px] underline">{r.tx_hash.slice(0, 10)}… ↗</a> : r.tx_hash ? <span className="text-gray-600 font-mono text-[10px]">{r.tx_hash.slice(0, 10)}…</span> : ''}
                         </td>
                       </tr>
                     ))}</tbody>

@@ -20,6 +20,23 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
   app.get('/pnl', (_req, res) => res.json((analytics.snapshot() as any).pnl));
   app.get('/analytics', (_req, res) => res.json(analytics.snapshot()));
 
+  // Resolve Polymarket condition/token ID → slug redirect
+  const slugCache = new Map<string, string>();
+  app.get('/pm/:tokenId', async (req, res) => {
+    const tid = req.params.tokenId;
+    if (slugCache.has(tid)) return res.redirect(`https://polymarket.com/event/${slugCache.get(tid)}`);
+    try {
+      const resp = await fetch(`https://gamma-api.polymarket.com/markets?clob_token_ids=${tid}&limit=1`);
+      const data = await resp.json() as any[];
+      if (data?.[0]?.slug) {
+        slugCache.set(tid, data[0].slug);
+        return res.redirect(`https://polymarket.com/event/${data[0].slug}`);
+      }
+    } catch {}
+    // Fallback: search by the token ID
+    res.redirect(`https://polymarket.com/markets?tid=${tid}`);
+  });
+
   app.get('/dashboard', (_req, res) => {
     const positions = db.listPositions() as any[];
     const trades = db.listTrades(250) as any[];
