@@ -238,7 +238,7 @@ export default function App() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [connected, setConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
-  const [tab, setTab] = useState<'dashboard' | 'positions' | 'trades' | 'redemptions'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'positions' | 'trades' | 'failed-trades' | 'redemptions'>('dashboard');
   const [showBreakdown, setShowBreakdown] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -278,10 +278,13 @@ export default function App() {
   const totalSpent = oc?.totalSpentOnTrades ?? 0;
   const clobReturns = oc?.totalClobReturns ?? 0;
 
+  const successTrades = trades.filter((t: any) => t.status === 'matched' || t.status === 'filled');
+  const failedTrades = trades.filter((t: any) => t.status !== 'matched' && t.status !== 'filled');
   const tabs = [
     { id: 'dashboard' as const, label: '📊 Dashboard' },
     { id: 'positions' as const, label: `📈 Positions (${positions.length})` },
-    { id: 'trades' as const, label: `🔄 Trades (${trades.length})` },
+    { id: 'trades' as const, label: `✅ Trades (${successTrades.length})` },
+    { id: 'failed-trades' as const, label: `❌ Failed (${failedTrades.length})` },
     { id: 'redemptions' as const, label: `💰 Redemptions (${oc?.redemptions?.length ?? 0})` },
   ];
 
@@ -443,7 +446,7 @@ export default function App() {
           {tab === 'trades' && (
             <motion.div key="trades" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <div className="bg-[#111827] border border-[#1e293b] rounded-xl p-4 sm:p-5">
-                <h3 className="text-sm font-semibold text-gray-300 mb-3">🔄 Trade History ({trades.length})</h3>
+                <h3 className="text-sm font-semibold text-gray-300 mb-3">✅ Successful Trades ({successTrades.length})</h3>
                 <div className="overflow-x-auto max-h-[75vh] overflow-y-auto">
                   <table className="w-full text-xs sm:text-sm">
                     <thead className="sticky top-0 bg-[#111827] z-10"><tr className="text-[10px] uppercase tracking-wider text-gray-500 border-b border-[#1e293b]">
@@ -453,7 +456,7 @@ export default function App() {
                       <th className="text-right py-2 px-2 sm:px-3">Size</th><th className="text-right py-2 px-2 sm:px-3">Edge</th>
                       <th className="text-right py-2 px-2 sm:px-3">Status</th><th className="text-right py-2 px-2 sm:px-3">Links</th>
                     </tr></thead>
-                    <tbody>{trades.map((t: any, i: number) => {
+                    <tbody>{successTrades.map((t: any, i: number) => {
                       const meta = parseMeta(t.meta);
                       return (
                         <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors">
@@ -467,6 +470,53 @@ export default function App() {
                           <td className="py-2 px-2 sm:px-3 text-right font-mono">{fmt(t.size)}</td>
                           <td className="py-2 px-2 sm:px-3 text-right font-mono text-blue-400">{fmt(t.edge)}%</td>
                           <td className="py-2 px-2 sm:px-3 text-right"><span className={`text-[10px] px-1.5 py-0.5 rounded-full ${t.status === 'matched' || t.status === 'filled' ? 'bg-emerald-500/20 text-emerald-400' : t.status === 'FAILED' ? 'bg-red-500/20 text-red-400' : 'bg-yellow-500/20 text-yellow-400'}`}>{t.status}</span></td>
+                          <td className="py-2 px-2 sm:px-3 text-right space-x-1">
+                            {isRealTxHash(t.tx_hash) && <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">TX ↗</a>}
+                            <a href={pmLink(t.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
+                          </td>
+                        </tr>
+                      );
+                    })}</tbody>
+                  </table>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {/* ═══ FAILED TRADES TAB ═══ */}
+          {tab === 'failed-trades' && (
+            <motion.div key="failed-trades" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <div className="bg-[#111827] border border-[#1e293b] rounded-xl p-4 sm:p-5">
+                <div className="flex justify-between items-center mb-3">
+                  <h3 className="text-sm font-semibold text-gray-300">❌ Failed / Delayed Trades ({failedTrades.length})</h3>
+                  <span className="text-xs text-red-400 font-mono">{failedTrades.filter((t: any) => t.status === 'FAILED').length} failed · {failedTrades.filter((t: any) => t.status === 'delayed').length} delayed · {failedTrades.filter((t: any) => t.status !== 'FAILED' && t.status !== 'delayed').length} other</span>
+                </div>
+                <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 mb-3 text-[11px] text-red-400">
+                  ⚠️ These trades were attempted but did not fill successfully — FAILED (rejected/error), delayed (not confirmed), or other non-success statuses.
+                </div>
+                <div className="overflow-x-auto max-h-[75vh] overflow-y-auto">
+                  <table className="w-full text-xs sm:text-sm">
+                    <thead className="sticky top-0 bg-[#111827] z-10"><tr className="text-[10px] uppercase tracking-wider text-gray-500 border-b border-[#1e293b]">
+                      <th className="text-left py-2 px-2 sm:px-3">When (EST)</th><th className="text-left py-2 px-2 sm:px-3">Team</th>
+                      <th className="text-left py-2 px-2 sm:px-3 hidden lg:table-cell">Game</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Side</th><th className="text-right py-2 px-2 sm:px-3">Price</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Size</th><th className="text-right py-2 px-2 sm:px-3">Edge</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Status</th><th className="text-right py-2 px-2 sm:px-3">Links</th>
+                    </tr></thead>
+                    <tbody>{failedTrades.map((t: any, i: number) => {
+                      const meta = parseMeta(t.meta);
+                      return (
+                        <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors opacity-75">
+                          <td className="py-2 px-2 sm:px-3 text-gray-400 font-mono text-[11px] whitespace-nowrap">{fmtSmartDate(t.ts)}</td>
+                          <td className="py-2 px-2 sm:px-3 font-medium whitespace-nowrap">
+                            <a href={pmLink(t.market_id)} target="_blank" rel="noreferrer" className="hover:text-purple-400 transition-colors underline decoration-gray-700 hover:decoration-purple-400">{t.outcome || 'N/A'}</a>
+                          </td>
+                          <td className="py-2 px-2 sm:px-3 text-gray-500 text-[11px] max-w-[200px] truncate hidden lg:table-cell">{meta.game || ''}</td>
+                          <td className={`py-2 px-2 sm:px-3 text-right font-semibold ${t.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}`}>{t.side}</td>
+                          <td className="py-2 px-2 sm:px-3 text-right font-mono">{fmt(t.price)}</td>
+                          <td className="py-2 px-2 sm:px-3 text-right font-mono">{fmt(t.size)}</td>
+                          <td className="py-2 px-2 sm:px-3 text-right font-mono text-blue-400">{fmt(t.edge)}%</td>
+                          <td className="py-2 px-2 sm:px-3 text-right"><span className={`text-[10px] px-1.5 py-0.5 rounded-full ${t.status === 'FAILED' ? 'bg-red-500/20 text-red-400' : 'bg-yellow-500/20 text-yellow-400'}`}>{t.status}</span></td>
                           <td className="py-2 px-2 sm:px-3 text-right space-x-1">
                             {isRealTxHash(t.tx_hash) && <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">TX ↗</a>}
                             <a href={pmLink(t.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
