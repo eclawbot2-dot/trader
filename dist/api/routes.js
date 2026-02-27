@@ -1,0 +1,50 @@
+function parseJson(input) {
+    if (!input)
+        return {};
+    if (typeof input === 'object')
+        return input;
+    try {
+        return JSON.parse(String(input));
+    }
+    catch {
+        return {};
+    }
+}
+export function registerRoutes(app, db, analytics) {
+    app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+    app.get('/positions', (_req, res) => res.json(db.listPositions()));
+    app.get('/trades', (req, res) => res.json(db.listTrades(Number(req.query.limit ?? 200))));
+    app.get('/balance', (_req, res) => res.json(db.latestBalance() ?? { usdc: 0, exposure: 0, equity: 0 }));
+    app.get('/pnl', (_req, res) => res.json(analytics.snapshot().pnl));
+    app.get('/analytics', (_req, res) => res.json(analytics.snapshot()));
+    app.get('/dashboard', (_req, res) => {
+        const positions = db.listPositions();
+        const trades = db.listTrades(250);
+        const tradeMetaByPosition = new Map();
+        for (const trade of trades) {
+            const key = `${trade.market_id}::${trade.outcome}`;
+            if (!tradeMetaByPosition.has(key))
+                tradeMetaByPosition.set(key, parseJson(trade.meta));
+        }
+        const enrichedPositions = positions.map((p) => {
+            const key = `${p.market_id}::${p.outcome}`;
+            const meta = tradeMetaByPosition.get(key) ?? {};
+            return { ...p, meta };
+        });
+        const edgeObservations = db.db
+            .prepare('SELECT ts, market_id, outcome, edge, settled, correct FROM edge_observations ORDER BY ts DESC LIMIT 800')
+            .all();
+        const redemptions = db.db
+            .prepare('SELECT id, ts, market_id, amount, tx_hash FROM redemptions ORDER BY ts DESC LIMIT 100')
+            .all();
+        res.json({
+            positions: enrichedPositions,
+            trades,
+            analytics: analytics.snapshot(),
+            equityCurve: db.getTimeSeries('equity', 1000),
+            drawdownSeries: db.getTimeSeries('drawdown', 1000),
+            edgeObservations,
+            redemptions,
+        });
+    });
+}

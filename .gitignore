@@ -1,0 +1,1 @@
+node_modules/\ndist/\nfrontend/node_modules/\nfrontend/dist/\n*.log\n.env\n.wallet.json\n.api-creds.json\n.notify-sent\n.notify.lock\npoly-edge.db\n

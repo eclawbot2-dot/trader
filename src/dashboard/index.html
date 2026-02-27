@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Poly Edge v2 — Trading Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Poly Edge v2</h1>
+        <p class="sub">Real-time execution and risk monitoring</p>
+      </div>
+      <div id="connectionStatus" class="status disconnected">Disconnected</div>
+    </header>
+
+    <main class="grid">
+      <section class="panel overview">
+        <h2>Portfolio Overview</h2>
+        <div class="kpis" id="overviewKpis"></div>
+      </section>
+
+      <section class="panel analytics">
+        <h2>Analytics</h2>
+        <div class="kpis compact" id="analyticsKpis"></div>
+      </section>
+
+      <section class="panel positions">
+        <h2>Open Positions</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Team</th>
+                <th>Sport</th>
+                <th>League</th>
+                <th>Shares</th>
+                <th>Avg Price</th>
+                <th>Current</th>
+                <th>Unrealized P&L</th>
+                <th>Edge @ Entry</th>
+              </tr>
+            </thead>
+            <tbody id="positionsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel trades">
+        <h2>Live Trade Feed</h2>
+        <div id="tradeFeed" class="feed"></div>
+      </section>
+
+      <section class="panel chart equity">
+        <h2>Equity Curve</h2>
+        <canvas id="equityChart"></canvas>
+      </section>
+
+      <section class="panel chart pnl-breakdown">
+        <h2>P&L Breakdown (Sport / League)</h2>
+        <canvas id="breakdownChart"></canvas>
+      </section>
+
+      <section class="panel chart edge-dist">
+        <h2>Edge Distribution (Entry vs Outcomes)</h2>
+        <canvas id="edgeChart"></canvas>
+      </section>
+
+      <section class="panel alerts">
+        <h2>Active Alerts</h2>
+        <ul id="alertsList" class="list"></ul>
+      </section>
+
+      <section class="panel redemptions">
+        <h2>Recent Redemptions</h2>
+        <ul id="redemptionsList" class="list"></ul>
+      </section>
+    </main>
+  </body>
+</html>

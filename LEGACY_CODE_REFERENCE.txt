@@ -1,0 +1,4714 @@
+/**
+ * Constants and Configuration
+ */
+const path = require('path');
+
+module.exports = {
+  // Contract addresses
+  CONTRACTS: {
+    USDC_E: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+    CTF: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
+    CTF_EXCHANGE: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+    NEG_RISK_CTF: '0xC5d563A36AE78145C45a50134d48A1215220f80a',
+    NEG_RISK_ADAPTER: '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296',
+  },
+  
+  // Wallet
+  WALLET: '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe',
+  
+  // Trading parameters
+  TRADING: {
+    EDGE_THRESHOLD: 0.02,      // 2% minimum edge
+    VIG_ADJUST_THRESHOLD: 0.02, // 2% vig-adjusted threshold
+    KELLY_FRACTION: 0.05,       // 5% of bankroll per trade
+    MAX_TRADE_SIZE: 5,          // $5 max per trade
+    MIN_TRADE_SIZE: 1,          // $1 min per trade
+    MIN_SHARES: 5,              // Polymarket minimum
+    ARB_THRESHOLD: 0.97,          // Both sides < $0.97 for guaranteed profit
+    ARB_MAX_BANKROLL: 0.20,      // 20% max for arb positions
+    PRICE_FLOOR_EDGE: 0.15,      // Hard floor for edge trades
+    PRICE_FLOOR_ARB: 0.05,       // Hard floor for arb trades
+    STALE_PINNACLE_THRESHOLD: 0.30, // Edge >30% + price <$0.30 = stale
+    MAX_EDGE_CAP: 0.15,          // Ignore edges >15%
+    RESOLUTION_HOURS: 72,        // Max hours to resolution
+  },
+  
+  // Timing intervals (milliseconds)
+  TIMING: {
+    AUDIT_INTERVAL: 5 * 60 * 1000,           // 5 minutes
+    EDGE_DECAY_5M: 5 * 60 * 1000,          // 5 minutes
+    EDGE_DECAY_30M: 30 * 60 * 1000,          // 30 minutes
+    PROACTIVE_ARB_INTERVAL: 15 * 1000,      // 15 seconds
+    REACTIVE_ARB_INTERVAL: 15 * 1000,       // 15 seconds
+    PRICE_CHECK_INTERVAL: 1000,             // 1 second
+    EDGE_LOG_DEDUPE: 60 * 1000,             // 1 minute
+    ORDER_COOLDOWN: 5 * 1000,               // 5 seconds
+  },
+  
+  // Gas settings
+  GAS: {
+    DEFAULT_MAX_FEE: '250',
+    DEFAULT_PRIORITY_FEE: '35',
+    REDEMPTION_MAX_FEE: '1200',
+    REDEMPTION_PRIORITY_FEE: '100',
+    GAS_LIMIT_REDEEM: 300000,
+  },
+  
+  // Sports configuration
+  SPORTS: {
+    NBA: { seriesId: '10345', pdLeague: 'NBA', label: 'NBA' },
+    NCAAB: { seriesId: '10470', pdLeague: 'NCAAB', label: 'NCAAB' },
+  },
+  
+  // File paths
+  FILES: {
+    LOG: 'trader.log',
+    LOG_ROTATED: 'trader.log.1',
+    LOG_MAX_SIZE: 500 * 1024,  // 500KB
+    ORDERS: 'executed-orders.jsonl',
+    SCENARIOS: 'trade-scenarios.jsonl',
+    EDGES: 'edge-histogram.jsonl',
+    NOTIFICATIONS: 'notifications.jsonl',
+    ALERTS: 'alerts.jsonl',
+    DASHBOARD: 'dashboard.json',
+    API_CREDS: '.api-creds.json',
+  },
+  
+  // Notification types
+  NOTIFY_TYPES: ['trade', 'arb', 'settle', 'redeem', 'transfer', 'error', 'warning'],
+  
+  // Order statuses
+  ORDER_STATUS: {
+    PENDING: 'PENDING',
+    LIVE: 'LIVE',
+    MATCHED: 'MATCHED',
+    FAILED: 'FAILED',
+    DELAYED: 'delayed',
+  },
+  
+  // Position statuses
+  POSITION_STATUS: {
+    ACTIVE: 'ACTIVE',
+    WON: 'WON (redeem!)',
+    RESOLVED: 'RESOLVED (dead)',
+  },
+};
+/**
+ * Polymarket CLOB Order Executor
+ * 
+ * Places real limit orders on Polymarket when edge signals fire.
+ * Uses @polymarket/clob-client SDK with ethers v5.
+ */
+
+const { ClobClient, Side, OrderType } = require('@polymarket/clob-client');
+const { Wallet, providers } = require('ethers');
+const fs = require('fs');
+const errorLog = require('./error-logger');
+const path = require('path');
+const db = require('./db');
+const C = require('../CONSTANTS'); // Centralized constants
+const { logTrace } = require('./trade-trace');
+
+const HOST = 'https://clob.polymarket.com';
+const CHAIN_ID = 137;
+
+// Helper to save trade to both JSONL and SQLite (fire-and-forget)
+function saveTrade(orderInfo) {
+  // Always save to JSONL
+  fs.appendFileSync('executed-orders.jsonl', JSON.stringify(orderInfo) + '\n');
+  
+  // Also save to SQLite (best effort, fire-and-forget)
+  if (db && db.insertTrade) {
+    db.insertTrade(orderInfo).catch(() => {}); // Silent fail
+  }
+}
+
+// === GAS PRICE AWARENESS ===
+async function getGasPrice(provider) {
+  try {
+    const gasPrice = await provider.getGasPrice();
+    const gwei = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
+    return gwei;
+  } catch (err) {
+    console.log('[Gas] Failed to fetch gas price:', err.message);
+    return 100; // Assume reasonable default
+  }
+}
+
+async function checkGasPrice(provider) {
+  const config = C.RISK?.gasPrice;
+  if (!config?.enabled) return { ok: true, gwei: 0 };
+  
+  const gwei = await getGasPrice(provider);
+  const isSurge = gwei > (config.maxGwei || 500);
+  
+  if (isSurge) {
+    console.log(`[Gas] ⚠️ Surge pricing: ${gwei.toFixed(0)} gwei > ${config.maxGwei} limit`);
+    return { ok: false, gwei, surge: true };
+  }
+  
+  if (gwei > config.surgeMultiplier * 100) { // Alert if above 1.5x average (assume 100 avg)
+    console.log(`[Gas] Elevated: ${gwei.toFixed(0)} gwei`);
+  }
+  
+  return { ok: true, gwei };
+}
+
+// === POSITION SIZING BY CONFIDENCE ===
+// Scale bet size by edge magnitude
+function calculatePositionSize(edgePercent, baseSize = 10) {
+  const sizing = C.STRATEGY?.positionSizing;
+  if (!sizing?.enabled) return baseSize;
+  
+  // Determine bucket
+  let multiplier = 1.0;
+  const absEdge = Math.abs(edgePercent);
+  
+  if (absEdge >= 10) multiplier = sizing.multipliers['10%+'] || 3.0;
+  else if (absEdge >= 7) multiplier = sizing.multipliers['7-10%'] || 2.5;
+  else if (absEdge >= 5) multiplier = sizing.multipliers['5-7%'] || 2.0;
+  else if (absEdge >= 3) multiplier = sizing.multipliers['3-5%'] || 1.5;
+  
+  const sized = baseSize * multiplier;
+  return Math.min(sized, sizing.maxDollars || 30);
+}
+
+// === SLIPPAGE TRACKING ===
+function trackSlippage(orderInfo, executionPrice) {
+  const slippage = orderInfo.price - executionPrice;
+  const slippagePct = (slippage / orderInfo.price) * 100;
+  
+  orderInfo.expectedPrice = orderInfo.price;
+  orderInfo.actualPrice = executionPrice;
+  orderInfo.slippage = slippage;
+  orderInfo.slippagePct = slippagePct;
+  
+  // Log significant slippage
+  if (Math.abs(slippagePct) > 1) {
+    console.log(`  [Slippage] ${slippagePct.toFixed(2)}% | Expected $${orderInfo.price} | Got $${executionPrice}`);
+  }
+}
+
+// Alert function for immediate notification on critical failures
+function sendAlert(type, message) {
+  const now = new Date();
+  const alert = {
+    time: now.toISOString(),
+    timeEST: now.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true }),
+    type,
+    message,
+  };
+  fs.appendFileSync('alerts.jsonl', JSON.stringify(alert) + '\n');
+  console.log(`[ALERT] ${message}`);
+  
+  // Also write to notifications queue for Telegram
+  const notifyTypes = ['trade', 'arb', 'settle', 'redeem', 'transfer', 'error'];
+  if (notifyTypes.includes(type)) {
+    try {
+      const nowN = new Date();
+      const notification = {
+        time: nowN.toISOString(),
+        timeEST: nowN.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true }),
+        type,
+        message,
+        sent: false,
+      };
+      fs.appendFileSync('notifications.jsonl', JSON.stringify(notification) + '\n');
+      
+      // === DIRECT TELEGRAM WEBHOOK ===
+      // Try immediate delivery if configured
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      const chatId = process.env.TELEGRAM_CHAT_ID;
+      
+      if (botToken && chatId && type !== 'error') { // Don't spam errors
+        const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+        fetch(telegramUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            chat_id: chatId, 
+            text: message,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          }),
+        }).catch(() => {}); // Silent fail, file-based queue is backup
+      }
+    } catch (err) {
+      console.error('[Notify] Error:', err.message);
+    }
+  }
+}
+
+class Executor {
+  constructor(opts = {}) {
+    this.betSize = opts.betSize || 1; // USDC per trade
+    this.maxOpenOrders = opts.maxOpenOrders || 10;
+    this.maxExposure = opts.maxExposure || 20; // max total USDC at risk
+    this.dryRun = opts.dryRun !== undefined ? opts.dryRun : true; // default to paper mode
+    
+    this.client = null;
+    this.signer = null;
+    this.totalExposure = 0;
+    this.orderCount = 0;
+    this.orders = []; // track placed orders
+    
+    // Rate limiting
+    this.lastOrderTime = 0;
+    this.minOrderInterval = 5000; // 5s between orders
+  }
+
+  async init() {
+    const privateKey = process.env.PRIVATE_KEY;
+    if (!privateKey) throw new Error('PRIVATE_KEY env var required');
+
+    this.signer = new Wallet(privateKey);
+    console.log(`  [Executor] Wallet: ${this.signer.address}`);
+    console.log(`  [Executor] Mode: ${this.dryRun ? 'DRY RUN (paper)' : '🔴 LIVE TRADING'}`);
+    console.log(`  [Executor] Bet size: $${this.betSize} | Max exposure: $${this.maxExposure}`);
+
+    // Load or derive API creds
+    const credsPath = path.join(process.cwd(), '.api-creds.json');
+    let creds;
+    if (fs.existsSync(credsPath)) {
+      creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+      console.log('  [Executor] Loaded API creds from file');
+    } else {
+      const tempClient = new ClobClient(HOST, CHAIN_ID, this.signer);
+      const derived = await tempClient.createOrDeriveApiKey();
+      creds = derived;
+      fs.writeFileSync(credsPath, JSON.stringify(derived, null, 2));
+      console.log('  [Executor] Derived new API creds');
+    }
+
+    this.client = new ClobClient(
+      HOST,
+      CHAIN_ID,
+      this.signer,
+      creds,
+      0, // Signature type: EOA
+      this.signer.address, // Funder
+    );
+
+    // Verify connection
+    const openOrders = await this.client.getOpenOrders();
+    console.log(`  [Executor] Connected | Open orders: ${openOrders.length || 0}`);
+    
+    // Initialize SQLite database
+    try {
+      await db.init();
+      console.log('  [Executor] SQLite database ready');
+    } catch (err) {
+      console.warn('  [Executor] SQLite init failed:', err.message);
+    }
+    
+    return this;
+  }
+
+  /**
+   * Execute a trade based on an edge signal
+   * @param {object} signal - { tokenId, conditionId, team, price, edge, direction, game, sport }
+   */
+  async execute(signal) {
+    const traceId = signal.traceId || `no-trace-${Date.now()}`;
+    logTrace(traceId, 'executor.enter', 'info', { team: signal.team, game: signal.game, sport: signal.sport, price: signal.price, edge: signal.edge });
+
+    const side = signal.direction === 'BUY_POLY' ? Side.BUY : Side.SELL;
+
+    // Pre-flight checks
+    if (side === Side.BUY && this.totalExposure + this.betSize > this.maxExposure) {
+      console.log(`  [Executor] SKIP: Max exposure reached ($${this.totalExposure}/$${this.maxExposure})`);
+      logTrace(traceId, 'executor.precheck', 'rejected', { reason: 'max_exposure', totalExposure: this.totalExposure, maxExposure: this.maxExposure });
+      return null;
+    }
+
+    if (side === Side.BUY && this.orderCount >= this.maxOpenOrders) {
+      console.log(`  [Executor] SKIP: Max open orders reached (${this.orderCount}/${this.maxOpenOrders})`);
+      logTrace(traceId, 'executor.precheck', 'rejected', { reason: 'max_open_orders', orderCount: this.orderCount, maxOpenOrders: this.maxOpenOrders });
+      return null;
+    }
+
+    // Rate limit
+    const now = Date.now();
+    if (now - this.lastOrderTime < this.minOrderInterval) {
+      console.log(`  [Executor] SKIP: Rate limited (${this.minOrderInterval}ms cooldown)`);
+      logTrace(traceId, 'executor.precheck', 'rejected', { reason: 'rate_limited', minOrderInterval: this.minOrderInterval });
+      return null;
+    }
+
+    if (!signal.tokenId) {
+      console.log(`  [Executor] SKIP: No tokenId for ${signal.team}`);
+      logTrace(traceId, 'executor.precheck', 'rejected', { reason: 'missing_token_id' });
+      return null;
+    }
+
+    const price = Math.round(signal.price * 100) / 100; // Round to cents (0.01 tick)
+    
+    // === POSITION SIZING BY CONFIDENCE ===
+    const dynamicSize = calculatePositionSize(signal.edge || 0, this.betSize);
+    const size = signal.size ? Math.max(1, Math.floor(signal.size)) : Math.max(5, Math.ceil(dynamicSize / price)); // Min 5 shares for buys unless explicit override
+    
+    if (signal.edge >= 5) {
+      console.log(`  [Position Sizing] Edge: ${signal.edge}% | Multiplier applied: $${dynamicSize} vs base $${this.betSize}`);
+    }
+
+    if (side === Side.BUY && price * size > this.maxExposure - this.totalExposure) {
+      console.log(`  [Executor] SKIP: Would exceed exposure limit`);
+      logTrace(traceId, 'executor.precheck', 'rejected', { reason: 'exposure_limit', cost: price * size, remaining: this.maxExposure - this.totalExposure });
+      return null;
+    }
+
+    const nowTs = new Date();
+    const orderInfo = {
+      timestamp: nowTs.toISOString(),
+      timestampEST: nowTs.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true }),
+      team: signal.team,
+      game: signal.game,
+      sport: signal.sport,
+      strategy: signal.strategy || 'edge', // Feature 9: Tag order strategy
+      side: side === Side.BUY ? 'BUY' : 'SELL',
+      price,
+      size,
+      cost: (price * size).toFixed(2),
+      edge: signal.edge,
+      tokenId: signal.tokenId,
+      traceId,
+    };
+
+    console.log(`\n  [Executor] ${this.dryRun ? 'PAPER' : '🔴 LIVE'} ORDER:`);
+    console.log(`    ${orderInfo.side} ${orderInfo.size} shares of "${orderInfo.team}" @ $${orderInfo.price}`);
+    console.log(`    Game: ${orderInfo.game} | Edge: ${orderInfo.edge}% | Cost: $${orderInfo.cost}`);
+
+    if (this.dryRun) {
+      orderInfo.status = 'PAPER';
+      logTrace(traceId, 'executor.paper', 'success', { order: orderInfo });
+      orderInfo.orderId = 'paper-' + Date.now();
+      this.orders.push(orderInfo);
+      if (side === Side.BUY) this.totalExposure += parseFloat(orderInfo.cost);
+      else this.totalExposure = Math.max(0, this.totalExposure - parseFloat(orderInfo.cost));
+      this.orderCount++;
+      this.lastOrderTime = now;
+      
+      // Log to file
+      saveTrade(orderInfo);
+      return orderInfo;
+    }
+
+    // Pre-check CLOB balance before spending money (BUY only)
+    if (side === Side.BUY) {
+      try {
+        const bal = await this.client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+        const clobBal = parseInt(bal.balance) / 1e6;
+        if (clobBal < price * size) {
+          console.log(`  [Executor] SKIP: CLOB balance $${clobBal.toFixed(2)} < order cost $${(price * size).toFixed(2)}`);
+          logTrace(traceId, 'executor.precheck', 'rejected', { reason: 'clob_balance_low', clobBal, orderCost: price * size });
+          return null;
+        }
+      } catch (e) {
+        console.log(`  [Executor] WARNING: Could not check CLOB balance: ${e.message}`);
+      }
+    }
+
+    // === PRICE IMPACT CHECK ===
+    // Estimate market impact before executing
+    async function checkPriceImpact(tokenId, size, side) {
+      try {
+        const bookResp = await fetch('https://clob.polymarket.com/book?token_id=' + tokenId);
+        const book = await bookResp.json();
+        
+        const orders = side === Side.BUY ? (book.asks || []) : (book.bids || []);
+        const sorted = orders.sort((a, b) => side === Side.BUY 
+          ? parseFloat(a.price) - parseFloat(b.price)
+          : parseFloat(b.price) - parseFloat(a.price));
+        
+        // Calculate average fill price for full size
+        let remaining = size;
+        let totalCost = 0;
+        let liquidityDepth = 0;
+        
+        for (const level of sorted) {
+          const levelSize = parseFloat(level.size);
+          const levelPrice = parseFloat(level.price);
+          const take = Math.min(remaining, levelSize);
+          
+          totalCost += take * levelPrice;
+          liquidityDepth += levelSize;
+          remaining -= take;
+          
+          if (remaining <= 0) break;
+        }
+        
+        if (remaining > 0) {
+          return { 
+            impact: Infinity, 
+            avgPrice: null, 
+            slippage: 1, 
+            available: liquidityDepth,
+            ok: false,
+            reason: 'insufficient_liquidity'
+          };
+        }
+        
+        const avgPrice = totalCost / size;
+        const bestPrice = sorted[0] ? parseFloat(sorted[0].price) : avgPrice;
+        const slippage = Math.abs(avgPrice - bestPrice) / bestPrice;
+        
+        // Flag if impact > 2%
+        const ok = slippage < 0.02;
+        
+        return {
+          impact: slippage * 100, // percent
+          avgPrice,
+          bestPrice,
+          slippage,
+          available: liquidityDepth,
+          ok,
+          reason: ok ? null : 'high_impact'
+        };
+      } catch (err) {
+        console.log(`  [Price Impact] Check failed: ${err.message}`);
+        return { ok: true, impact: 0, error: err.message }; // Fail open
+      }
+    }
+
+    // LIVE execution
+    try {
+      // === PRICE IMPACT PRE-CHECK ===
+      const impactCheck = await checkPriceImpact(signal.tokenId, size, side);
+      if (!impactCheck.ok) {
+        if (impactCheck.reason === 'insufficient_liquidity') {
+          console.log(`  [Executor] SKIP: Insufficient liquidity (need ${size}, have ${impactCheck.available.toFixed(0)})`);
+        } else if (impactCheck.reason === 'high_impact') {
+          console.log(`  [Executor] SKIP: Price impact too high (${impactCheck.impact.toFixed(2)}% > 2%)`);
+        }
+        return null;
+      }
+      
+      if (impactCheck.impact > 0.5) {
+        console.log(`  [Price Impact] ⚠️ Elevated: ${impactCheck.impact.toFixed(2)}% | Avg fill: $${impactCheck.avgPrice.toFixed(3)} vs best: $${impactCheck.bestPrice.toFixed(3)}`);
+      }
+      
+      // Fetch REAL order book and sort properly
+      const bookResp = await fetch('https://clob.polymarket.com/book?token_id=' + signal.tokenId);
+      const book = await bookResp.json();
+      const sortedAsks = (book.asks || []).sort((a,b) => parseFloat(a.price) - parseFloat(b.price));
+      const sortedBids = (book.bids || []).sort((a,b) => parseFloat(b.price) - parseFloat(b.price));
+      
+      const realBestAsk = sortedAsks[0] ? parseFloat(sortedAsks[0].price) : null;
+      const realBestBid = sortedBids[0] ? parseFloat(sortedBids[0].price) : null;
+      
+      console.log(`  [Executor] REAL BOOK: bid $${realBestBid} / ask $${realBestAsk} (spread: $${((realBestAsk||0) - (realBestBid||0)).toFixed(3)})`);
+      
+      if (!realBestAsk || realBestAsk >= 0.90) {
+        console.log(`  [Executor] SKIP: Ask too high ($${realBestAsk})`);
+        return null;
+      }
+      
+      const execPrice = realBestAsk;
+      console.log(`  [Executor] 🎯 FOK @ $${execPrice} (SORTED real ask)`);
+
+      // Get market details for tick size and neg risk
+      let tickSize = '0.01';
+      let negRisk = false;
+      
+      if (signal.conditionId) {
+        try {
+          const market = await this.client.getMarket(signal.conditionId);
+          tickSize = String(market.minimum_tick_size || '0.01');
+          negRisk = market.neg_risk || false;
+        } catch (e) {
+          console.log(`  [Executor] Warning: couldn't fetch market details, using defaults`);
+        }
+      }
+
+      logTrace(traceId, 'executor.submit', 'info', { tokenId: signal.tokenId, side: orderInfo.side, execPrice, size, tickSize, negRisk });
+      const response = await this.client.createAndPostOrder(
+        {
+          tokenID: signal.tokenId,
+          price: execPrice,
+          size,
+          side,
+          orderType: OrderType.FOK,  // FILL OR KILL - NO PUSSY LIMIT ORDERS
+        },
+        {
+          tickSize,
+          negRisk,
+        },
+      );
+
+      const status = response.status || response.Status || 'UNKNOWN';
+      orderInfo.status = status;
+      orderInfo.orderId = response.orderID || response.id;
+      
+      // === SMART ORDER ROUTING: PARTIAL FILL HANDLING ===
+      const filledSize = response.size || response.filledSize || size;
+      const fillPercent = (filledSize / size) * 100;
+      const smartRouting = C.STRATEGY?.smartRouting;
+      
+      // Track slippage
+      const actualPrice = response.price || response.executionPrice || execPrice;
+      trackSlippage(orderInfo, actualPrice);
+      
+      // Check for partial fill
+      if (fillPercent < 100 && fillPercent > 0 && smartRouting?.acceptPartial) {
+        if (fillPercent >= (smartRouting.partialMinPercent || 50)) {
+          console.log(`  [Smart Routing] ✅ PARTIAL FILL accepted: ${filledSize}/${size} shares (${fillPercent.toFixed(0)}%)`);
+          orderInfo.size = filledSize;
+          orderInfo.cost = (actualPrice * filledSize).toFixed(2);
+          orderInfo.fillPercent = fillPercent;
+          orderInfo.partialFill = true;
+          
+          // Try to fill remaining on retry
+          if (smartRouting.retryUnfilled && filledSize < size) {
+            const remaining = size - filledSize;
+            console.log(`  [Smart Routing] 🔄 Will retry ${remaining} shares...`);
+            // Continue with partial, retry happens on next signal
+          }
+          
+          saveTrade(orderInfo);
+          sendAlert('trade', `📊 PARTIAL FILL: ${signal.team} @ $${actualPrice} | ${filledSize}/${size} shares (${fillPercent.toFixed(0)}%)`);
+          
+          this.orders.push(orderInfo);
+          if (side === Side.BUY) this.totalExposure += parseFloat(orderInfo.cost);
+          else this.totalExposure = Math.max(0, this.totalExposure - parseFloat(orderInfo.cost));
+          this.orderCount++;
+          this.lastOrderTime = now;
+          return orderInfo;
+        } else {
+          console.log(`  [Smart Routing] ❌ Partial fill too small: ${fillPercent.toFixed(0)}% < ${smartRouting.partialMinPercent}% minimum`);
+          orderInfo.status = 'REJECTED_PARTIAL';
+          saveTrade(orderInfo);
+          return null;
+        }
+      }
+      
+      // Detect failed orders — CLOB returns status codes or error strings
+      const failStatuses = ['FAILED', 'EXPIRED', 'REJECTED', 400, 403, 500, 'error'];
+      const isFailed = failStatuses.includes(status) || !orderInfo.orderId || 
+        (typeof status === 'number' && status >= 400) ||
+        (response.error || response.errorMsg);
+      
+      if (isFailed) {
+        const errMsg = response.error || response.errorMsg || response.data?.error || `Status: ${status}`;
+        console.error(`  [Executor] ❌ Order REJECTED: ${errMsg}`);
+        errorLog.error('executor', 'Order rejected: ' + errMsg, { team: signal.team, price, size, tokenId: signal.tokenId });
+        orderInfo.status = 'FAILED';
+        orderInfo.error = errMsg;
+        orderInfo.retryCount = orderInfo.retryCount || 0;
+        logTrace(traceId, 'executor.response', 'failed', { status, errMsg, response });
+        saveTrade(orderInfo);
+        
+        // CRITICAL: Alert immediately on region block or authentication issues
+        if (errMsg.includes('region') || errMsg.includes('geoblock') || errMsg.includes('restricted') || errMsg.includes('Trading restricted')) {
+          sendAlert('error', `🚨 CRITICAL: Geoblock active! Trade rejected: ${signal.team} @ $${price} | ${errMsg.substring(0, 60)}`);
+        } else if (errMsg.includes('insufficient') || errMsg.includes('balance')) {
+          sendAlert('error', `⚠️ INSUFFICIENT FUNDS: ${signal.team} @ $${price} | ${errMsg.substring(0, 60)}`);
+        } else {
+          sendAlert('error', `❌ ORDER FAILED: ${signal.team} @ $${price} | ${errMsg.substring(0, 60)}`);
+        }
+        
+        // === RETRY LOGIC ===
+        // Retry transient errors up to 3 times with exponential backoff
+        const retryableErrors = ['timeout', 'network', 'ECONNRESET', 'ETIMEDOUT', '429', 'rate limit', 'temporarily'];
+        const shouldRetry = retryableErrors.some(e => errMsg.toLowerCase().includes(e)) && orderInfo.retryCount < 3;
+        
+        if (shouldRetry) {
+          orderInfo.retryCount++;
+          const delay = Math.pow(2, orderInfo.retryCount) * 1000; // 2s, 4s, 8s
+          console.log(`  [Executor] 🔄 Retrying (${orderInfo.retryCount}/3) in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+          return this.execute(signal); // Retry
+        }
+        
+        return null;
+      }
+      
+      console.log(`  [Executor] ✅ Order placed: ${orderInfo.orderId} (${orderInfo.status})`);
+      logTrace(traceId, 'executor.response', 'success', { orderId: orderInfo.orderId, status: orderInfo.status, cost: orderInfo.cost, fillPercent: orderInfo.fillPercent || 100 });
+      
+      this.orders.push(orderInfo);
+      if (side === Side.BUY) this.totalExposure += parseFloat(orderInfo.cost);
+      else this.totalExposure = Math.max(0, this.totalExposure - parseFloat(orderInfo.cost));
+      this.orderCount++;
+      this.lastOrderTime = now;
+      
+      saveTrade(orderInfo);
+      return orderInfo;
+
+    } catch (err) {
+      console.error(`  [Executor] ❌ Order failed: ${err.message}`);
+      errorLog.error('executor', 'Order exception: ' + err.message.substring(0, 200), { team: signal.team, price, size });
+      orderInfo.status = 'FAILED';
+      orderInfo.error = err.message;
+      logTrace(traceId, 'executor.exception', 'failed', { error: err.message });
+      saveTrade(orderInfo);
+      return null;
+    }
+  }
+
+  // === buyFOK for Arb Locks ===
+  async buyFOK(tokenId, size, maxPrice) {
+    const now = Date.now();
+    
+    // Rate limiting
+    if (now - this.lastOrderTime < this.minOrderInterval) {
+      const wait = this.minOrderInterval - (now - this.lastOrderTime);
+      console.log(`  [buyFOK] Rate limited — waiting ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+
+    try {
+      // Pre-check CLOB balance
+      try {
+        const bal = await this.client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+        const clobBal = parseInt(bal.balance) / 1e6;
+        if (clobBal < maxPrice * size) {
+          console.log(`  [buyFOK] SKIP: CLOB $${clobBal.toFixed(2)} < cost $${(maxPrice * size).toFixed(2)}`);
+          sendAlert('error', `⚠️ INSUFFICIENT FUNDS: Need $${(maxPrice * size).toFixed(2)}, have $${clobBal.toFixed(2)}`);
+          return { status: 'FAILED', error: 'insufficient balance' };
+        }
+      } catch {}
+      
+      // Verify price hasn't moved
+      const bookResp = await fetch('https://clob.polymarket.com/book?token_id=' + tokenId);
+      const book = await bookResp.json();
+      const sortedAsks = (book.asks || []).sort((a,b) => parseFloat(a.price) - parseFloat(b.price));
+      const realBestAsk = sortedAsks[0] ? parseFloat(sortedAsks[0].price) : null;
+      
+      if (!realBestAsk || realBestAsk > maxPrice * 1.01) {  // 1% slippage tolerance
+        console.log(`  [buyFOK] Price moved — ask $${realBestAsk} > max $${maxPrice}`);
+        return { status: 'EXPIRED', price: realBestAsk };
+      }
+
+      const { Side, OrderType } = require('@polymarket/clob-client');
+      
+      const response = await this.client.createAndPostOrder(
+        {
+          tokenID: tokenId,
+          price: realBestAsk,
+          size: size,
+          side: Side.BUY,
+          orderType: OrderType.FOK,
+        },
+        { tickSize: '0.01', negRisk: false }
+      );
+
+      this.lastOrderTime = Date.now();
+      
+      const status = response.status || response.Status || 'UNKNOWN';
+      const failStatuses = ['FAILED', 'EXPIRED', 'REJECTED', 400, 403, 500];
+      const isFailed = failStatuses.includes(status) || !response.orderID || 
+        (typeof status === 'number' && status >= 400) || response.error;
+      
+      if (isFailed) {
+        const errMsg = response.error || response.errorMsg || response.data?.error || `Status: ${status}`;
+        console.error(`  [buyFOK] ❌ Order REJECTED: ${errMsg}`);
+        
+        // CRITICAL: Alert immediately on region block or authentication issues
+        if (errMsg.includes('region') || errMsg.includes('geoblock') || errMsg.includes('restricted') || errMsg.includes('Trading restricted')) {
+          sendAlert('error', `🚨 CRITICAL: Geoblock active! Arb order rejected: $${maxPrice} | ${errMsg.substring(0, 60)}`);
+        } else if (errMsg.includes('insufficient') || errMsg.includes('balance')) {
+          sendAlert('error', `⚠️ INSUFFICIENT FUNDS: Arb order $${maxPrice} | ${errMsg.substring(0, 60)}`);
+        } else {
+          sendAlert('error', `❌ ARB ORDER FAILED: $${maxPrice} | ${errMsg.substring(0, 60)}`);
+        }
+        return { status: 'FAILED', error: errMsg };
+      }
+      
+      return {
+        status,
+        orderId: response.orderID || response.id,
+        price: realBestAsk,
+        size,
+        side: 'BUY',
+        cost: (realBestAsk * size).toFixed(2),
+      };
+    } catch (err) {
+      console.error(`  [buyFOK] ❌ Failed: ${err.message}`);
+      return { status: 'FAILED', error: err.message };
+    }
+  }
+
+  getStatus() {
+    return {
+      mode: this.dryRun ? 'PAPER' : 'LIVE',
+      orders: this.orders.length,
+      totalExposure: this.totalExposure.toFixed(2),
+      maxExposure: this.maxExposure,
+    };
+  }
+}
+
+// === FUND TRANSFER SAFETY PROTOCOL — HARDCODED ===
+// ANY code that moves USDC MUST:
+// 1. Send $0.75-$0.99 test first
+// 2. Verify on-chain arrival
+// 3. Get human confirmation
+// 4. Then send remaining via same path
+// 5. NEVER send full balance in one shot
+// Violation of this protocol burned $26.51 on 2026-02-21.
+// This comment exists so future-me can't claim ignorance.
+
+module.exports = { Executor };
+/**
+ * SQLite Database Module
+ * Replaces JSONL files with structured storage for better query performance
+ */
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const fs = require('fs');
+
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'polyedge.db');
+
+class Database {
+  constructor() {
+    this.db = null;
+  }
+
+  async init() {
+    if (this.db) return this.db;
+    
+    this.db = new sqlite3.Database(DB_PATH);
+    
+    // Enable WAL mode for better concurrency
+    await this.run('PRAGMA journal_mode = WAL');
+    await this.run('PRAGMA synchronous = NORMAL');
+    
+    // Create tables
+    await this._createTables();
+    
+    console.log('[DB] Initialized at', DB_PATH);
+    return this.db;
+  }
+
+  async _createTables() {
+    // Trades table
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        team TEXT NOT NULL,
+        game TEXT NOT NULL,
+        sport TEXT,
+        strategy TEXT,
+        side TEXT NOT NULL,
+        price REAL NOT NULL,
+        size REAL NOT NULL,
+        cost REAL NOT NULL,
+        edge REAL,
+        tokenId TEXT,
+        orderId TEXT,
+        status TEXT NOT NULL,
+        error TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create indexes
+    await this.run('CREATE INDEX IF NOT EXISTS idx_trades_team ON trades(team)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(DATE(timestamp))');
+    
+    // Scenarios table (for tracking trade outcomes)
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS scenarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        team TEXT NOT NULL,
+        game TEXT NOT NULL,
+        sport TEXT,
+        entryPrice REAL NOT NULL,
+        shares REAL NOT NULL,
+        cost REAL NOT NULL,
+        edge REAL,
+        spread REAL,
+        minutesIntoGame REAL,
+        arbPossibleAtExit INTEGER,
+        result TEXT,
+        pnl REAL,
+        settled_at TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await this.run('CREATE INDEX IF NOT EXISTS idx_scenarios_result ON scenarios(result)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_scenarios_team ON scenarios(team)');
+    
+    // Edges observed table
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS edges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        team TEXT NOT NULL,
+        game TEXT NOT NULL,
+        edge REAL,
+        traded INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await this.run('CREATE INDEX IF NOT EXISTS idx_edges_timestamp ON edges(timestamp)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_edges_team ON edges(team)');
+    
+    // Errors table
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        component TEXT NOT NULL,
+        message TEXT NOT NULL,
+        context TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await this.run('CREATE INDEX IF NOT EXISTS idx_errors_severity ON errors(severity)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_errors_component ON errors(component)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_errors_time ON errors(timestamp)');
+    
+    // Metrics table (time-series data)
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_value REAL NOT NULL,
+        tags TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await this.run('CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(metric_name)');
+    await this.run('CREATE INDEX IF NOT EXISTS idx_metrics_time ON metrics(timestamp)');
+    
+    // Notifications table
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        sent INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await this.run('CREATE INDEX IF NOT EXISTS idx_notifications_sent ON notifications(sent)');
+  }
+
+  run(sql, params = []) {
+    return new Promise((resolve, reject) => {
+      this.db.run(sql, params, function(err) {
+        if (err) reject(err);
+        else resolve({ id: this.lastID, changes: this.changes });
+      });
+    });
+  }
+
+  get(sql, params = []) {
+    return new Promise((resolve, reject) => {
+      this.db.get(sql, params, (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    });
+  }
+
+  all(sql, params = []) {
+    return new Promise((resolve, reject) => {
+      this.db.all(sql, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    });
+  }
+
+  // Trade operations
+  async insertTrade(trade) {
+    const sql = `
+      INSERT INTO trades (timestamp, team, game, sport, strategy, side, price, size, cost, edge, tokenId, orderId, status, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    const params = [
+      trade.timestamp,
+      trade.team,
+      trade.game,
+      trade.sport || null,
+      trade.strategy || 'edge',
+      trade.side,
+      trade.price,
+      trade.size,
+      trade.cost,
+      trade.edge || null,
+      trade.tokenId || null,
+      trade.orderId || null,
+      trade.status,
+      trade.error || null
+    ];
+    return this.run(sql, params);
+  }
+
+  async getTrades(filters = {}) {
+    let sql = 'SELECT * FROM trades WHERE 1=1';
+    const params = [];
+    
+    if (filters.date) {
+      sql += ' AND DATE(timestamp) = ?';
+      params.push(filters.date);
+    }
+    if (filters.strategy) {
+      sql += ' AND strategy = ?';
+      params.push(filters.strategy);
+    }
+    if (filters.status) {
+      sql += ' AND status = ?';
+      params.push(filters.status);
+    }
+    if (filters.team) {
+      sql += ' AND team LIKE ?';
+      params.push(`%${filters.team}%`);
+    }
+    if (filters.sport) {
+      sql += ' AND sport = ?';
+      params.push(filters.sport);
+    }
+    
+    sql += ' ORDER BY timestamp DESC';
+    
+    if (filters.limit) {
+      sql += ' LIMIT ?';
+      params.push(filters.limit);
+    }
+    
+    return this.all(sql, params);
+  }
+
+  async getTradeStats(date) {
+    const sql = `
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'FAILED' OR status = 400 THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN status != 'FAILED' AND status != 400 THEN 1 ELSE 0 END) as succeeded,
+        AVG(CASE WHEN status != 'FAILED' THEN cost ELSE NULL END) as avg_cost
+      FROM trades
+      WHERE DATE(timestamp) = ?
+    `;
+    return this.get(sql, [date]);
+  }
+
+  // Scenario operations
+  async insertScenario(scenario) {
+    const sql = `
+      INSERT INTO scenarios (timestamp, team, game, sport, entryPrice, shares, cost, edge, spread, minutesIntoGame, arbPossibleAtExit)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    const params = [
+      scenario.timestamp,
+      scenario.team,
+      scenario.game,
+      scenario.sport || null,
+      scenario.entryPrice,
+      scenario.shares,
+      scenario.cost,
+      scenario.edge || null,
+      scenario.spread || null,
+      scenario.minutesIntoGame || null,
+      scenario.arbPossibleAtExit ? 1 : 0
+    ];
+    return this.run(sql, params);
+  }
+
+  async updateScenarioResult(team, game, result, pnl) {
+    const sql = `
+      UPDATE scenarios 
+      SET result = ?, pnl = ?, settled_at = ?
+      WHERE team = ? AND game = ? AND result IS NULL
+    `;
+    return this.run(sql, [result, pnl, new Date().toISOString(), team, game]);
+  }
+
+  async getScenarioStats(date) {
+    const sql = `
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses,
+        SUM(pnl) as total_pnl,
+        AVG(edge) as avg_edge
+      FROM scenarios
+      ${date ? 'WHERE DATE(timestamp) = ?' : ''}
+    `;
+    return date ? this.get(sql, [date]) : this.get(sql);
+  }
+
+  // Edge operations
+  async insertEdge(edge) {
+    const sql = 'INSERT INTO edges (timestamp, team, game, edge, traded) VALUES (?, ?, ?, ?, ?)';
+    return this.run(sql, [edge.timestamp, edge.team, edge.game, edge.edge, edge.traded ? 1 : 0]);
+  }
+
+  async getEdgeStats(date) {
+    const sql = `
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN traded = 1 THEN 1 ELSE 0 END) as traded_count
+      FROM edges
+      WHERE DATE(timestamp) = ?
+    `;
+    return this.get(sql, [date]);
+  }
+
+  // Error operations
+  async insertError(error) {
+    const sql = 'INSERT INTO errors (timestamp, severity, component, message, context) VALUES (?, ?, ?, ?, ?)';
+    const context = error.context ? JSON.stringify(error.context) : null;
+    return this.run(sql, [error.timestamp, error.severity, error.component, error.message, context]);
+  }
+
+  async getRecentErrors(minutes = 60) {
+    const sql = `
+      SELECT severity, component, message, timestamp,
+             COUNT(*) as count
+      FROM errors
+      WHERE timestamp > datetime('now', ?)
+      GROUP BY severity, component, message
+      ORDER BY count DESC
+    `;
+    return this.all(sql, [`-${minutes} minutes`]);
+  }
+
+  // Metrics operations
+  async insertMetric(name, value, tags = {}) {
+    const sql = 'INSERT INTO metrics (timestamp, metric_name, metric_value, tags) VALUES (?, ?, ?, ?)';
+    return this.run(sql, [new Date().toISOString(), name, value, JSON.stringify(tags)]);
+  }
+
+  async getMetrics(name, hours = 24) {
+    const sql = `
+      SELECT timestamp, metric_value, tags
+      FROM metrics
+      WHERE metric_name = ? AND timestamp > datetime('now', ?)
+      ORDER BY timestamp ASC
+    `;
+    return this.all(sql, [name, `-${hours} hours`]);
+  }
+
+  // Notification operations
+  async insertNotification(notification) {
+    const sql = 'INSERT INTO notifications (timestamp, type, message, sent) VALUES (?, ?, ?, ?)';
+    return this.run(sql, [notification.timestamp || new Date().toISOString(), notification.type, notification.message, notification.sent ? 1 : 0]);
+  }
+
+  async getUnsentNotifications() {
+    const sql = 'SELECT * FROM notifications WHERE sent = 0 ORDER BY timestamp ASC';
+    return this.all(sql);
+  }
+
+  async markNotificationsSent(ids) {
+    const placeholders = ids.map(() => '?').join(',');
+    const sql = `UPDATE notifications SET sent = 1 WHERE id IN (${placeholders})`;
+    return this.run(sql, ids);
+  }
+
+  // Migration: JSONL → SQLite
+  async migrateFromJSONL() {
+    const migrated = { trades: 0, scenarios: 0, edges: 0, errors: 0 };
+    
+    // Migrate trades
+    if (fs.existsSync('executed-orders.jsonl')) {
+      const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const order = JSON.parse(line);
+          await this.insertTrade(order);
+          migrated.trades++;
+        } catch {}
+      }
+    }
+    
+    // Migrate scenarios
+    if (fs.existsSync('trade-scenarios.jsonl')) {
+      const lines = fs.readFileSync('trade-scenarios.jsonl', 'utf-8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const scenario = JSON.parse(line);
+          await this.insertScenario(scenario);
+          migrated.scenarios++;
+        } catch {}
+      }
+    }
+    
+    // Migrate edges
+    if (fs.existsSync('edge-histogram.jsonl')) {
+      const lines = fs.readFileSync('edge-histogram.jsonl', 'utf-8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const edge = JSON.parse(line);
+          await this.insertEdge(edge);
+          migrated.edges++;
+        } catch {}
+      }
+    }
+    
+    // Migrate errors
+    if (fs.existsSync('errors.jsonl')) {
+      const lines = fs.readFileSync('errors.jsonl', 'utf-8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const error = JSON.parse(line);
+          await this.insertError(error);
+          migrated.errors++;
+        } catch {}
+      }
+    }
+    
+    console.log('[DB] Migration complete:', migrated);
+    return migrated;
+  }
+
+  // Analytics queries
+  async getPnLByTimeframe(days = 7) {
+    const sql = `
+      SELECT 
+        DATE(timestamp) as date,
+        SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses,
+        SUM(pnl) as daily_pnl
+      FROM scenarios
+      WHERE timestamp > date('now', ?)
+      GROUP BY DATE(timestamp)
+      ORDER BY date ASC
+    `;
+    return this.all(sql, [`-${days} days`]);
+  }
+
+  async getPnLByEdgeBucket() {
+    const sql = `
+      SELECT 
+        CASE 
+          WHEN edge < 3 THEN '0-3%'
+          WHEN edge < 5 THEN '3-5%'
+          WHEN edge < 10 THEN '5-10%'
+          ELSE '10%+'
+        END as bucket,
+        COUNT(*) as trades,
+        SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+        SUM(pnl) as total_pnl
+      FROM scenarios
+      WHERE result IS NOT NULL
+      GROUP BY bucket
+    `;
+    return this.all(sql);
+  }
+
+  async getWinRateByStrategy() {
+    const sql = `
+      SELECT 
+        strategy,
+        COUNT(*) as total,
+        SUM(CASE WHEN status != 'FAILED' THEN 1 ELSE 0 END) as success,
+        ROUND(100.0 * SUM(CASE WHEN status != 'FAILED' THEN 1 ELSE 0 END) / COUNT(*), 1) as success_rate
+      FROM trades
+      GROUP BY strategy
+    `;
+    return this.all(sql);
+  }
+
+  close() {
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+  }
+}
+
+module.exports = new Database();
+/**
+ * Polymarket CLOB WebSocket Client
+ *
+ * Connects to the Polymarket market WebSocket for real-time bid/ask data.
+ * No authentication needed for read-only market data.
+ *
+ * Protocol:
+ * - Subscribe: { type: "market", assets_ids: [tokenId1, tokenId2, ...] }
+ * - Events:
+ *     book (initial snapshot): array of { event_type: "book", asset_id, bids: [...], asks: [...] }
+ *       - bids/asks NOT sorted by best price — must sort ourselves
+ *     price_change (incremental): { market: "0x...", price_changes: [{asset_id, best_bid, best_ask, price, size, side}, ...] }
+ *       - Contains best_bid/best_ask which are the true top-of-book
+ *     last_trade_price: { asset_id, price }
+ * - Keepalive: send "PING" every 10 seconds
+ */
+
+const WebSocket = require('ws');
+const { EventEmitter } = require('events');
+
+const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
+const PING_INTERVAL = 10000;
+const RECONNECT_DELAY = 3000;
+const MAX_RECONNECT_DELAY = 30000;
+
+class PolymarketWS extends EventEmitter {
+  constructor(tokens) {
+    super();
+    // tokens: [{ name, tokenId, marketType, line }]
+    this.tokens = tokens;
+    this.tokenMap = new Map(); // tokenId -> { name, marketType, line }
+    for (const t of tokens) {
+      this.tokenMap.set(t.tokenId, t);
+    }
+
+    this.ws = null;
+    this.pingTimer = null;
+    this.reconnectDelay = RECONNECT_DELAY;
+    this.closed = false;
+
+    // Current state per token
+    this.state = new Map(); // tokenId -> { bestBid, bestAsk, lastTrade, timestamp }
+  }
+
+  connect() {
+    if (this.closed) return;
+
+    console.log('  [Polymarket WS] Connecting...');
+    this.ws = new WebSocket(WS_URL);
+
+    this.ws.on('open', () => {
+      console.log('  [Polymarket WS] Connected');
+      this.reconnectDelay = RECONNECT_DELAY;
+      this._subscribe();
+      this._startPing();
+    });
+
+    this.ws.on('message', (data) => {
+      this._handleMessage(data.toString());
+    });
+
+    this.ws.on('close', (code) => {
+      console.log(`  [Polymarket WS] Disconnected (${code})`);
+      this._stopPing();
+      this._reconnect();
+    });
+
+    this.ws.on('error', (err) => {
+      console.error(`  [Polymarket WS] Error: ${err.message}`);
+    });
+  }
+
+  _subscribe() {
+    const assetIds = this.tokens.map(t => t.tokenId);
+    const msg = JSON.stringify({
+      type: 'market',
+      assets_ids: assetIds,
+    });
+    this.ws.send(msg);
+    console.log(`  [Polymarket WS] Subscribed to ${assetIds.length} tokens`);
+  }
+
+  _startPing() {
+    this._stopPing();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send('PING');
+      }
+    }, PING_INTERVAL);
+  }
+
+  _stopPing() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  _reconnect() {
+    if (this.closed) return;
+    console.log(`  [Polymarket WS] Reconnecting in ${this.reconnectDelay}ms...`);
+    setTimeout(() => {
+      this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
+      this.connect();
+    }, this.reconnectDelay);
+  }
+
+  _handleMessage(raw) {
+    if (raw === 'PONG' || raw === 'pong') return;
+
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    // Batch of book snapshots: [{event_type: "book", asset_id, bids, asks}, ...]
+    if (Array.isArray(msg)) {
+      for (const event of msg) {
+        this._processBookEvent(event);
+      }
+      return;
+    }
+
+    // price_change envelope: { market: "0x...", price_changes: [{asset_id, best_bid, best_ask, ...}, ...] }
+    if (msg.price_changes) {
+      for (const change of msg.price_changes) {
+        this._processPriceChange(change);
+      }
+      return;
+    }
+
+    // last_trade_price or single event with asset_id
+    if (msg.asset_id) {
+      const eventType = msg.event_type || msg.type;
+      if (eventType === 'book') {
+        this._processBookEvent(msg);
+      } else if (eventType === 'last_trade_price') {
+        this._processLastTrade(msg);
+      }
+    }
+  }
+
+  /**
+   * Process a book snapshot event.
+   * bids/asks arrays are NOT sorted by best price — sort them ourselves.
+   */
+  _processBookEvent(event) {
+    const assetId = event.asset_id;
+    if (!assetId) return;
+
+    const tokenInfo = this.tokenMap.get(assetId);
+    if (!tokenInfo) return;
+
+    const bids = (event.bids || []).map(b => parseFloat(b.price)).filter(p => p > 0);
+    const asks = (event.asks || []).map(a => parseFloat(a.price)).filter(p => p > 0);
+
+    // Best bid = highest, best ask = lowest
+    bids.sort((a, b) => b - a);
+    asks.sort((a, b) => a - b);
+
+    const bestBid = bids.length > 0 ? bids[0] : null;
+    const bestAsk = asks.length > 0 ? asks[0] : null;
+
+    this.state.set(assetId, {
+      bestBid,
+      bestAsk,
+      midpoint: bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null,
+      lastTrade: this.state.get(assetId)?.lastTrade || null,
+      timestamp: Date.now(),
+    });
+
+    this._emitUpdate(assetId, tokenInfo);
+  }
+
+  /**
+   * Process a price_change entry.
+   * Each entry has: { asset_id, price, size, side, best_bid, best_ask, hash }
+   * best_bid and best_ask are the true top-of-book after this change.
+   */
+  _processPriceChange(change) {
+    const assetId = change.asset_id;
+    if (!assetId) return;
+
+    const tokenInfo = this.tokenMap.get(assetId);
+    if (!tokenInfo) return;
+
+    const existing = this.state.get(assetId) || {};
+
+    // best_bid and best_ask from the change are authoritative
+    const bestBid = change.best_bid ? parseFloat(change.best_bid) : existing.bestBid;
+    const bestAsk = change.best_ask ? parseFloat(change.best_ask) : existing.bestAsk;
+
+    this.state.set(assetId, {
+      bestBid,
+      bestAsk,
+      midpoint: bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null,
+      lastTrade: existing.lastTrade,
+      timestamp: Date.now(),
+    });
+
+    this._emitUpdate(assetId, tokenInfo);
+  }
+
+  /**
+   * Process a last_trade_price event.
+   */
+  _processLastTrade(event) {
+    const assetId = event.asset_id;
+    if (!assetId) return;
+
+    const tokenInfo = this.tokenMap.get(assetId);
+    if (!tokenInfo) return;
+
+    const existing = this.state.get(assetId) || {};
+    existing.lastTrade = parseFloat(event.price);
+    existing.timestamp = Date.now();
+    this.state.set(assetId, existing);
+
+    this._emitUpdate(assetId, tokenInfo);
+  }
+
+  _emitUpdate(assetId, tokenInfo) {
+    const s = this.state.get(assetId);
+    if (!s) return;
+
+    this.emit('price', {
+      source: 'polymarket',
+      tokenId: assetId,
+      name: tokenInfo.name,
+      marketType: tokenInfo.marketType,
+      line: tokenInfo.line,
+      bestBid: s.bestBid,
+      bestAsk: s.bestAsk,
+      midpoint: s.midpoint,
+      lastTrade: s.lastTrade,
+      timestamp: s.timestamp,
+    });
+  }
+
+  getState() {
+    const result = {};
+    for (const [tokenId, state] of this.state) {
+      const info = this.tokenMap.get(tokenId);
+      result[tokenId] = { ...state, ...info };
+    }
+    return result;
+  }
+
+  close() {
+    this.closed = true;
+    this._stopPing();
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+}
+
+module.exports = { PolymarketWS };
+/**
+ * Game Resolver - Finds & matches a game across Polymarket and PredictionData
+ *
+ * Flow:
+ * 1. Fetch Polymarket events via gamma API series endpoint
+ * 2. For each event, fetch full details to get clobTokenIds
+ * 3. Fetch PredictionData fixtures for the league
+ * 4. Match games by team name similarity + date
+ * 5. Return matched game with IDs needed for both streams
+ */
+
+const POLYMARKET_API = 'https://gamma-api.polymarket.com';
+const PREDICTIONDATA_API = 'https://api.predictiondata.io/api';
+const PREDICTIONDATA_KEY = process.env.PREDICTIONDATA_API_KEY || require('../CONSTANTS').API_KEYS.predictionData;
+
+const SPORT_CONFIG = {
+  nba: { seriesId: '10345', pdLeague: 'NBA', label: 'NBA' },
+  ncaab: { seriesId: '10470', pdLeague: 'NCAAB', label: 'NCAAB' },
+};
+
+// --- Matching helpers (adapted from scripts/arb-scanner.js) ---
+
+function normalizeTeamName(name) {
+  if (!name) return '';
+  return name.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+}
+
+function teamsMatch(name1, name2) {
+  const n1 = normalizeTeamName(name1);
+  const n2 = normalizeTeamName(name2);
+  if (n1 === n2) return true;
+  if (n1.includes(n2) || n2.includes(n1)) return true;
+
+  // Require at least 2 words to overlap (prevents mascot-only false matches
+  // like "Samford Bulldogs" matching "Fresno State Bulldogs")
+  const words1 = n1.split(' ');
+  const words2 = n2.split(' ');
+  const overlap = words1.filter(w => w.length > 2 && words2.includes(w));
+  if (overlap.length >= 2) return true;
+
+  return false;
+}
+
+function datesMatch(date1, date2) {
+  if (!date1 || !date2) return false;
+  const d1 = new Date(date1).toISOString().split('T')[0];
+  const d2 = new Date(date2).toISOString().split('T')[0];
+  if (d1 === d2) return true;
+  const diff = Math.abs(new Date(d1) - new Date(d2));
+  return diff <= 24 * 60 * 60 * 1000;
+}
+
+// --- Fetch helpers ---
+
+async function fetchJSON(url, headers = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    return res.json();
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') throw new Error(`Timeout fetching ${url}`);
+    throw err;
+  }
+}
+
+// --- Polymarket ---
+
+async function fetchPolymarketEvents(sportKey) {
+  const cfg = SPORT_CONFIG[sportKey];
+  if (!cfg) throw new Error(`Unsupported sport: ${sportKey}`);
+
+  console.log(`  Fetching Polymarket series ${cfg.seriesId} (${cfg.label})...`);
+  const data = await fetchJSON(`${POLYMARKET_API}/series/${cfg.seriesId}`);
+  const events = data.events || [];
+
+  // Filter to future/active events with dates
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+  const futureEvents = events.filter(e => {
+    if (e.closed) return false;
+    const dateMatch = e.slug.match(/(\d{4}-\d{2}-\d{2})/);
+    return dateMatch && dateMatch[1] >= yesterday;
+  });
+
+  console.log(`  Found ${futureEvents.length} active Polymarket events`);
+  return futureEvents;
+}
+
+async function fetchPolymarketEventDetails(slug) {
+  // Primary: lookup by slug
+  const url = `${POLYMARKET_API}/events?slug=${encodeURIComponent(slug)}`;
+  const events = await fetchJSON(url);
+  return events[0] || null;
+}
+
+async function fetchPolymarketEventDetailsById(eventId) {
+  if (!eventId) return null;
+  try {
+    const url = `${POLYMARKET_API}/events/${eventId}`;
+    return await fetchJSON(url);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract token IDs and team names from a Polymarket event
+ */
+function extractPolymarketData(event) {
+  if (!event.markets) return null;
+
+  const result = {
+    eventId: event.id,
+    slug: event.slug,
+    title: event.title,
+    startDate: event.startDate || event.endDate,
+    tokens: [],     // { name, tokenId, side }
+    markets: [],    // Full market data for display
+  };
+
+  for (const m of event.markets) {
+    const marketType = m.sportsMarketType;
+
+    // Only care about moneyline
+    if (marketType !== 'moneyline') continue;
+
+    const outcomes = JSON.parse(m.outcomes || '[]');
+    const prices = JSON.parse(m.outcomePrices || '[]');
+    const tokens = JSON.parse(m.clobTokenIds || '[]');
+
+    const marketInfo = {
+      type: marketType,
+      id: m.id,
+      conditionId: m.conditionId,
+      question: m.question,
+      volume: m.volume || 0,
+      liquidity: m.liquidity || m.liquidityClob || 0,
+      bestBid: m.bestBid,
+      bestAsk: m.bestAsk,
+      spread: m.spread,
+      outcomes: outcomes.map((name, i) => ({
+        name,
+        price: prices[i],
+        tokenId: tokens[i],
+      })),
+    };
+
+    result.markets.push(marketInfo);
+
+    // Collect token IDs for WebSocket subscription
+    tokens.forEach((tokenId, i) => {
+      if (tokenId) {
+        result.tokens.push({
+          name: outcomes[i],
+          tokenId,
+          marketType,
+        });
+      }
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Parse team names from a Polymarket event slug or title
+ */
+function parseTeamNames(event) {
+  // Try title first: "Team A vs Team B" or "Team A @ Team B"
+  const title = event.title || '';
+  const vsMatch = title.match(/(.+?)\s+(?:vs\.?|@)\s+(.+)/i);
+  if (vsMatch) {
+    return { team1: vsMatch[1].trim(), team2: vsMatch[2].trim() };
+  }
+
+  // Parse from slug: sport-team1-team2-YYYY-MM-DD
+  const slug = event.slug || '';
+  const parts = slug.split('-');
+  if (parts.length >= 4) {
+    const date = parts.slice(-3).join('-');
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const teamParts = parts.slice(1, -3);
+      if (teamParts.length >= 2) {
+        return { team1: teamParts[0], team2: teamParts[1] };
+      }
+    }
+  }
+
+  return null;
+}
+
+// --- PredictionData ---
+
+async function fetchPDFixtures(sportKey) {
+  const cfg = SPORT_CONFIG[sportKey];
+  console.log(`  Fetching PredictionData fixtures for ${cfg.pdLeague}...`);
+
+  const url = `${PREDICTIONDATA_API}/fixtures?league=${cfg.pdLeague}`;
+  const data = await fetchJSON(url, { 'X-API-KEY': PREDICTIONDATA_KEY });
+  // API wraps in { fixtures: [...] }
+  const fixtures = data.fixtures || data.data || (Array.isArray(data) ? data : []);
+
+  // Filter to upcoming fixtures only
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+  const upcoming = fixtures.filter(f => {
+    const d = (f.date || '').split('T')[0];
+    return d >= yesterday && f.status !== 'closed';
+  });
+
+  console.log(`  Found ${fixtures.length} total, ${upcoming.length} upcoming PredictionData fixtures`);
+  return upcoming;
+}
+
+async function fetchPDMarkets(sportKey) {
+  const cfg = SPORT_CONFIG[sportKey];
+  const url = `${PREDICTIONDATA_API}/markets?league=${cfg.pdLeague}&bet_types=moneyline,spread,total&periods=FT&book_ids=100,200,250`;
+  const data = await fetchJSON(url, { 'X-API-KEY': PREDICTIONDATA_KEY });
+  // API wraps in { markets: [...] }
+  return data.markets || data.data || (Array.isArray(data) ? data : []);
+}
+
+// --- Game matching ---
+
+function matchGames(polyEvents, pdFixtures) {
+  const matched = [];
+  const seenKeys = new Set(); // Dedup: prevent same matchup appearing multiple times
+
+  for (const polyEvent of polyEvents) {
+    const teams = parseTeamNames(polyEvent);
+    if (!teams) continue;
+    // Filter out events with undefined/missing team names
+    if (!teams.team1 || !teams.team2 || teams.team1 === 'undefined' || teams.team2 === 'undefined') continue;
+
+    const polyDate = polyEvent.slug.match(/(\d{4}-\d{2}-\d{2})/)?.[1];
+
+    for (const fixture of pdFixtures) {
+      const pdHome = fixture.home_team || fixture.home;
+      const pdAway = fixture.away_team || fixture.away;
+      if (!pdHome || !pdAway) continue;
+      const pdDate = fixture.start_time || fixture.commence_time || fixture.date;
+
+      if (!datesMatch(polyDate, pdDate)) continue;
+
+      const homeMatch = teamsMatch(teams.team1, pdHome) || teamsMatch(teams.team1, pdAway);
+      const awayMatch = teamsMatch(teams.team2, pdAway) || teamsMatch(teams.team2, pdHome);
+
+      if (homeMatch && awayMatch) {
+        // Dedup: one match per home+away+date combo
+        const dedupKey = `${pdHome}|${pdAway}|${polyDate}`;
+        if (seenKeys.has(dedupKey)) break;
+        seenKeys.add(dedupKey);
+
+        matched.push({
+          polyEvent,
+          pdFixture: fixture,
+          teams: {
+            home: pdHome,
+            away: pdAway,
+          },
+          date: polyDate,
+        });
+        break;
+      }
+    }
+  }
+
+  return matched;
+}
+
+// --- Main resolver ---
+
+/**
+ * Resolve a game to watch: find matching game across both sources
+ * @param {string} sportKey - 'nba' or 'ncaab'
+ * @param {object} opts - { gameIndex: 0 } to pick a specific game from the list
+ * @returns {object} Resolved game with IDs for both streams
+ */
+async function resolveGame(sportKey, opts = {}) {
+  console.log('\n--- Game Resolution ---\n');
+
+  // Fetch from both sources in parallel
+  const [polyEvents, pdFixtures] = await Promise.all([
+    fetchPolymarketEvents(sportKey),
+    fetchPDFixtures(sportKey),
+  ]);
+
+  if (!polyEvents.length) throw new Error('No Polymarket events found');
+  if (!pdFixtures.length) throw new Error('No PredictionData fixtures found');
+
+  // Match games
+  console.log('  Matching games across sources...');
+  const matched = matchGames(polyEvents, pdFixtures);
+  console.log(`  Found ${matched.length} matched game(s)\n`);
+
+  if (matched.length === 0) {
+    console.log('  Polymarket events:');
+    polyEvents.slice(0, 5).forEach(e => {
+      const teams = parseTeamNames(e);
+      console.log(`    ${e.title || e.slug} ${teams ? `[${teams.team1} vs ${teams.team2}]` : ''}`);
+    });
+    console.log('  PredictionData fixtures:');
+    pdFixtures.slice(0, 5).forEach(f => {
+      console.log(`    ${f.home_team || f.home} vs ${f.away_team || f.away} (${f.start_time || f.date})`);
+    });
+    throw new Error('No matching games found between Polymarket and PredictionData');
+  }
+
+  // Sort: live games first, then by start time (soonest first)
+  const statusPriority = { inprogress: 0, scheduled: 1, closed: 2 };
+  const sorted = matched.sort((a, b) => {
+    const aPri = statusPriority[a.pdFixture.status] ?? 1;
+    const bPri = statusPriority[b.pdFixture.status] ?? 1;
+    if (aPri !== bPri) return aPri - bPri;
+    const aTime = new Date(a.pdFixture.start_time || a.pdFixture.date || 0).getTime();
+    const bTime = new Date(b.pdFixture.start_time || b.pdFixture.date || 0).getTime();
+    return aTime - bTime;
+  });
+
+  // Show available games for user reference
+  console.log('  Available games:');
+  for (let i = 0; i < Math.min(sorted.length, 15); i++) {
+    const g = sorted[i];
+    const status = g.pdFixture.status === 'inprogress' ? ' [LIVE]' : '';
+    console.log(`    ${i + 1}. ${g.teams.away} @ ${g.teams.home}${status}`);
+  }
+  if (sorted.length > 15) console.log(`    ... and ${sorted.length - 15} more`);
+  console.log();
+
+  // Pick game by index (opts.gameIndex) or default to first
+  const idx = Math.min(opts.gameIndex || 0, sorted.length - 1);
+  const pick = sorted[idx];
+  const liveTag = pick.pdFixture.status === 'inprogress' ? ' [LIVE]' : '';
+  console.log(`  Selected (#${idx + 1}): ${pick.teams.away} @ ${pick.teams.home}${liveTag}`);
+
+  // Fetch full Polymarket event details (to get token IDs)
+  console.log('  Fetching Polymarket event details...');
+  let fullEvent = await fetchPolymarketEventDetails(pick.polyEvent.slug);
+
+  // Fallback 1: fetch by event id
+  if (!fullEvent && pick.polyEvent?.id) {
+    console.log('  Detail lookup by slug failed, trying event-id fallback...');
+    fullEvent = await fetchPolymarketEventDetailsById(pick.polyEvent.id);
+  }
+
+  // Fallback 2: use series payload event directly (often already includes markets)
+  if (!fullEvent) {
+    console.log('  Detail lookup failed, using series payload fallback...');
+    fullEvent = pick.polyEvent;
+  }
+
+  const polyData = extractPolymarketData(fullEvent);
+  if (!polyData || polyData.tokens.length === 0) {
+    throw new Error(`No token IDs found in Polymarket event (${pick.polyEvent.slug})`);
+  }
+
+  console.log(`  Got ${polyData.tokens.length} Polymarket tokens across ${polyData.markets.length} markets`);
+
+  const fixtureId = pick.pdFixture.fixture_id || pick.pdFixture.id;
+
+  return {
+    sport: sportKey,
+    label: SPORT_CONFIG[sportKey].label,
+    teams: pick.teams,
+    date: pick.date,
+    gameTime: pick.pdFixture.start_time || pick.pdFixture.date,
+    polymarket: polyData,
+    predictionData: {
+      fixtureId,
+      fixture: pick.pdFixture,
+    },
+  };
+}
+
+/**
+ * Resolve a game by Polymarket slug directly.
+ * Fetches the event, extracts team names, then finds the matching PD fixture.
+ * @param {string} slug - Polymarket event slug (e.g., "cbb-laf-holy-2026-02-18")
+ * @returns {object} Resolved game with IDs for both streams
+ */
+async function resolveBySlug(slug) {
+  console.log('\n--- Resolving by slug ---\n');
+  console.log(`  Slug: ${slug}`);
+
+  // Detect sport from slug prefix
+  let sportKey = null;
+  for (const [key, cfg] of Object.entries(SPORT_CONFIG)) {
+    // Slugs start with sport prefix: "cbb-", "nba-", etc.
+    const prefixes = [key, cfg.pdLeague.toLowerCase()];
+    if (key === 'ncaab') prefixes.push('cbb');
+    if (key === 'nba') prefixes.push('nba');
+    for (const prefix of prefixes) {
+      if (slug.startsWith(prefix + '-')) {
+        sportKey = key;
+        break;
+      }
+    }
+    if (sportKey) break;
+  }
+
+  if (!sportKey) {
+    // Default to ncaab if can't detect
+    sportKey = 'ncaab';
+    console.log(`  Could not detect sport from slug, defaulting to ${sportKey}`);
+  } else {
+    console.log(`  Detected sport: ${sportKey}`);
+  }
+
+  // Fetch Polymarket event details
+  console.log('  Fetching Polymarket event...');
+  const fullEvent = await fetchPolymarketEventDetails(slug);
+  if (!fullEvent) throw new Error(`No Polymarket event found for slug: ${slug}`);
+
+  const polyData = extractPolymarketData(fullEvent);
+  if (!polyData || polyData.tokens.length === 0) {
+    throw new Error('No token IDs found in Polymarket event');
+  }
+
+  // Extract team names from the event
+  const teams = parseTeamNames(fullEvent);
+  const polyDate = slug.match(/(\d{4}-\d{2}-\d{2})/)?.[1];
+
+  console.log(`  Event: ${fullEvent.title}`);
+  console.log(`  Teams: ${teams?.team1 || '?'} vs ${teams?.team2 || '?'}`);
+  console.log(`  Date: ${polyDate}`);
+  console.log(`  Tokens: ${polyData.tokens.length} across ${polyData.markets.length} markets`);
+
+  // Fetch PD fixtures and find the match
+  const cfg = SPORT_CONFIG[sportKey];
+  console.log(`  Finding matching PredictionData fixture (${cfg.pdLeague})...`);
+  const pdFixtures = await fetchPDFixtures(sportKey);
+
+  let matchedFixture = null;
+  if (teams) {
+    for (const fixture of pdFixtures) {
+      const pdHome = fixture.home_team || fixture.home;
+      const pdAway = fixture.away_team || fixture.away;
+      const pdDate = fixture.start_time || fixture.commence_time || fixture.date;
+
+      if (!datesMatch(polyDate, pdDate)) continue;
+
+      const homeMatch = teamsMatch(teams.team1, pdHome) || teamsMatch(teams.team1, pdAway);
+      const awayMatch = teamsMatch(teams.team2, pdAway) || teamsMatch(teams.team2, pdHome);
+
+      if (homeMatch && awayMatch) {
+        matchedFixture = fixture;
+        break;
+      }
+    }
+  }
+
+  if (!matchedFixture) {
+    console.log('\n  WARNING: No matching PredictionData fixture found.');
+    console.log('  Polymarket data will stream, but no sportsbook comparison available.');
+    console.log('  PD fixtures available:');
+    pdFixtures.slice(0, 5).forEach(f => {
+      console.log(`    ${f.away_team} @ ${f.home_team} (${(f.date || '').split('T')[0]}) [${f.status}]`);
+    });
+  } else {
+    const liveTag = matchedFixture.status === 'inprogress' ? ' [LIVE]' : '';
+    console.log(`  Matched: ${matchedFixture.away_team} @ ${matchedFixture.home_team}${liveTag}`);
+  }
+
+  const resolvedTeams = matchedFixture
+    ? { home: matchedFixture.home_team, away: matchedFixture.away_team }
+    : { home: teams?.team2 || 'Team 2', away: teams?.team1 || 'Team 1' };
+
+  return {
+    sport: sportKey,
+    label: cfg.label,
+    teams: resolvedTeams,
+    date: polyDate,
+    gameTime: matchedFixture?.start_time || matchedFixture?.date || polyDate,
+    polymarket: polyData,
+    predictionData: {
+      fixtureId: matchedFixture ? (matchedFixture.fixture_id || matchedFixture.id) : null,
+      fixture: matchedFixture,
+    },
+  };
+}
+
+async function resolveAllGames(sportKey) {
+  console.log('\n--- Game Resolution (ALL) ---\n');
+
+  const [polyEvents, pdFixtures] = await Promise.all([
+    fetchPolymarketEvents(sportKey),
+    fetchPDFixtures(sportKey),
+  ]);
+
+  if (!polyEvents.length) throw new Error('No Polymarket events found');
+  if (!pdFixtures.length) throw new Error('No PredictionData fixtures found');
+
+  console.log('  Matching games across sources...');
+  const matched = matchGames(polyEvents, pdFixtures);
+  console.log(`  Found ${matched.length} matched game(s)`);
+
+  if (matched.length === 0) return [];
+
+  const statusPriority = { inprogress: 0, scheduled: 1, closed: 2 };
+  const sorted = matched.sort((a, b) => {
+    const aPri = statusPriority[a.pdFixture.status] ?? 1;
+    const bPri = statusPriority[b.pdFixture.status] ?? 1;
+    if (aPri !== bPri) return aPri - bPri;
+    const aTime = new Date(a.pdFixture.start_time || a.pdFixture.date || 0).getTime();
+    const bTime = new Date(b.pdFixture.start_time || b.pdFixture.date || 0).getTime();
+    return aTime - bTime;
+  });
+
+  const resolved = [];
+  for (const pick of sorted) {
+    try {
+      let fullEvent = await fetchPolymarketEventDetails(pick.polyEvent.slug);
+      if (!fullEvent && pick.polyEvent?.id) {
+        fullEvent = await fetchPolymarketEventDetailsById(pick.polyEvent.id);
+      }
+      if (!fullEvent) fullEvent = pick.polyEvent;
+
+      const polyData = extractPolymarketData(fullEvent);
+      if (!polyData || polyData.tokens.length === 0) continue;
+
+      const fixtureId = pick.pdFixture.fixture_id || pick.pdFixture.id;
+      resolved.push({
+        sport: sportKey,
+        label: SPORT_CONFIG[sportKey].label,
+        teams: pick.teams,
+        date: pick.date,
+        gameTime: pick.pdFixture.start_time || pick.pdFixture.date,
+        polymarket: polyData,
+        predictionData: {
+          fixtureId,
+          fixture: pick.pdFixture,
+        },
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  console.log(`  Resolved ${resolved.length}/${sorted.length} games with token IDs\n`);
+  return resolved;
+}
+
+module.exports = { resolveGame, resolveAllGames, resolveBySlug, SPORT_CONFIG, PREDICTIONDATA_KEY };
+/**
+ * Comparison Engine v2 - Vig-adjusted moneyline edge calculation
+ *
+ * Core change from v1: Remove sportsbook vig before calculating edge.
+ * Raw Pinnacle odds overstate both sides (e.g. 67% + 45% = 112%).
+ * Vig-adjusted: divide each by total to get true fair probabilities.
+ *
+ *   Vig-adjusted edge = Fair prob (vig-removed) - Polymarket ask price
+ *   Only flag if vig-adjusted edge > threshold
+ *
+ * Also enforces: if both sides show edge, only flag the bigger one.
+ */
+
+const EDGE_THRESHOLD = 0.03; // 3% minimum to flag
+
+class ComparisonEngine {
+  constructor() {
+    // polymarket state: tokenId -> { name, bestBid, bestAsk, midpoint, timestamp }
+    this.polyState = new Map();
+
+    // sportsbook state: "bookName:betType:teamName" -> { decimalOdds, impliedProb, timestamp }
+    this.bookState = new Map();
+
+    // Edge history for tracking over time
+    this.edgeHistory = [];
+  }
+
+  updatePoly(update) {
+    this.polyState.set(update.tokenId, {
+      name: update.name,
+      bestBid: update.bestBid,
+      bestAsk: update.bestAsk,
+      midpoint: update.midpoint,
+      lastTrade: update.lastTrade,
+      marketType: update.marketType,
+      timestamp: update.timestamp,
+    });
+  }
+
+  updateBook(update) {
+    const key = `${update.source}:${update.betType || 'moneyline'}:${update.name}`;
+    this.bookState.set(key, {
+      source: update.source,
+      name: update.name,
+      betType: update.betType || 'moneyline',
+      decimalOdds: update.decimalOdds,
+      impliedProb: update.impliedProb,
+      sideType: update.sideType,
+      timestamp: update.timestamp,
+    });
+  }
+
+  /**
+   * Get vig-adjusted fair probabilities for all book entries.
+   * Groups by source, sums implied probs, divides each by total.
+   */
+  _getVigAdjusted() {
+    const bySource = new Map(); // source -> [{ name, impliedProb, decimalOdds, ... }]
+    
+    for (const [, data] of this.bookState) {
+      if ((data.betType || 'moneyline') !== 'moneyline') continue;
+      const key = data.source;
+      if (!bySource.has(key)) bySource.set(key, []);
+      bySource.get(key).push(data);
+    }
+    
+    const adjusted = new Map(); // "source:name" -> { fairProb, rawProb, vig, ... }
+    
+    for (const [source, entries] of bySource) {
+      // Sum all implied probs for this book
+      const totalImplied = entries.reduce((sum, e) => sum + (e.impliedProb || 0), 0);
+      const vig = totalImplied > 0 ? totalImplied - 1 : 0;
+      
+      for (const entry of entries) {
+        const fairProb = totalImplied > 0 ? entry.impliedProb / totalImplied : entry.impliedProb;
+        const key = `${source}:${entry.name}`;
+        adjusted.set(key, {
+          ...entry,
+          fairProb,
+          rawProb: entry.impliedProb,
+          totalBook: totalImplied,
+          vigPct: (vig * 100).toFixed(1),
+        });
+      }
+    }
+    
+    return adjusted;
+  }
+
+  /**
+   * Calculate current moneyline edges using vig-adjusted probabilities.
+   */
+  calculate() {
+    const comparisons = {
+      moneyline: [],
+      edges: [],
+      timestamp: Date.now(),
+    };
+
+    // Get vig-adjusted book data
+    const vigAdjusted = this._getVigAdjusted();
+
+    for (const [tokenId, poly] of this.polyState) {
+      const row = {
+        name: poly.name,
+        tokenId,
+        polyBid: poly.bestBid,
+        polyAsk: poly.bestAsk,
+        polyMid: poly.midpoint,
+        polyLastTrade: poly.lastTrade,
+        polyTimestamp: poly.timestamp,
+        books: {},
+      };
+
+      for (const [, adj] of vigAdjusted) {
+        if (!this._namesMatch(poly.name, adj.name)) continue;
+        
+        row.books[adj.source] = {
+          decimalOdds: adj.decimalOdds,
+          rawImplied: adj.rawProb,
+          fairProb: adj.fairProb,
+          vig: adj.vigPct,
+          timestamp: adj.timestamp,
+        };
+
+        // Buy Poly edge: vig-adjusted fair prob > Poly ask
+        if (poly.bestAsk && adj.fairProb) {
+          const edge = adj.fairProb - poly.bestAsk;
+          if (edge > 0.001) {
+            comparisons.edges.push({
+              team: poly.name,
+              tokenId,
+              direction: 'BUY_POLY',
+              edge,
+              edgePct: (edge * 100).toFixed(1),
+              polyPrice: poly.bestAsk,
+              bookProb: adj.fairProb,       // VIG-ADJUSTED
+              rawBookProb: adj.rawProb,      // Raw (with vig)
+              bookOdds: adj.decimalOdds,
+              bookVig: adj.vigPct,
+              bookName: adj.source,
+              flagged: edge >= EDGE_THRESHOLD,
+            });
+          }
+        }
+
+        // Sell Poly edge: Poly bid > vig-adjusted fair prob
+        if (poly.bestBid && adj.fairProb) {
+          const edge = poly.bestBid - adj.fairProb;
+          if (edge > 0.001) {
+            comparisons.edges.push({
+              team: poly.name,
+              tokenId,
+              direction: 'SELL_POLY',
+              edge,
+              edgePct: (edge * 100).toFixed(1),
+              polyPrice: poly.bestBid,
+              bookProb: adj.fairProb,
+              rawBookProb: adj.rawProb,
+              bookOdds: adj.decimalOdds,
+              bookVig: adj.vigPct,
+              bookName: adj.source,
+              flagged: edge >= EDGE_THRESHOLD,
+            });
+          }
+        }
+      }
+
+      comparisons.moneyline.push(row);
+    }
+
+    // === ONLY FLAG THE BIGGER EDGE per game ===
+    // Group BUY_POLY edges by book source, find pairs (same game = same source entries)
+    // If both sides of a game show edge, only flag the larger one
+    const edgesByGame = new Map(); // loose game key -> [edges]
+    for (const edge of comparisons.edges) {
+      if (edge.direction !== 'BUY_POLY') continue;
+      // Use bookName as grouping (same source = same game data)
+      const gameKey = edge.bookName;
+      if (!edgesByGame.has(gameKey)) edgesByGame.set(gameKey, []);
+      edgesByGame.get(gameKey).push(edge);
+    }
+    
+    for (const [, edges] of edgesByGame) {
+      if (edges.length > 1) {
+        // Multiple teams showing edge from same book — only flag the biggest
+        edges.sort((a, b) => b.edge - a.edge);
+        for (let i = 1; i < edges.length; i++) {
+          edges[i].flagged = false;
+          edges[i].suppressedBy = edges[0].team;
+        }
+      }
+    }
+
+    // Sort edges biggest first
+    comparisons.edges.sort((a, b) => Math.abs(b.edge) - Math.abs(a.edge));
+
+    // Track history
+    if (comparisons.edges.length > 0) {
+      this.edgeHistory.push({
+        timestamp: Date.now(),
+        edges: comparisons.edges.slice(0, 5),
+      });
+      if (this.edgeHistory.length > 100) this.edgeHistory.shift();
+    }
+
+    return comparisons;
+  }
+
+  _namesMatch(name1, name2) {
+    if (!name1 || !name2) return false;
+    const n1 = name1.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+    const n2 = name2.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+    if (n1 === n2) return true;
+    if (n1.includes(n2) || n2.includes(n1)) return true;
+    // Require 2+ word overlap to prevent mascot-only false matches
+    // (e.g. "Samford Bulldogs" should NOT match "Fresno State Bulldogs")
+    const words1 = n1.split(' ');
+    const words2 = n2.split(' ');
+    const overlap = words1.filter(w => w.length > 2 && words2.includes(w));
+    if (overlap.length >= 2) return true;
+    return false;
+  }
+}
+
+/**
+ * Convert implied probability to American odds
+ */
+function toAmericanOdds(prob) {
+  if (prob >= 0.5) {
+    return Math.round(-(prob / (1 - prob)) * 100);
+  } else {
+    return '+' + Math.round(((1 - prob) / prob) * 100);
+  }
+}
+
+module.exports = { ComparisonEngine, toAmericanOdds, EDGE_THRESHOLD };
+/**
+ * Shared PredictionData SSE Client
+ * 
+ * ONE SSE connection for ALL games. Dispatches to registered fixture handlers.
+ * Pinnacle only (book 250) to keep it clean.
+ */
+
+const { EventEmitter } = require('events');
+
+const STREAM_URL = 'https://stream.predictiondata.io/v1/markets';
+const REST_URL = 'https://api.predictiondata.io/api/markets';
+const REST_POLL_INTERVAL = 60000; // 60s REST fallback
+const RECONNECT_DELAY = 5000;
+const MAX_RECONNECT_DELAY = 60000;
+const STALE_THRESHOLD_MS = 120000; // 2 minutes
+
+const BOOK_NAMES = { 250: 'pinnacle' };
+
+class SharedPDClient extends EventEmitter {
+  constructor(apiKey) {
+    super();
+    this.apiKey = apiKey;
+    this.closed = false;
+    this.reconnectDelay = RECONNECT_DELAY;
+    this.abortController = null;
+    this.pollTimer = null;
+    this.sseConnected = false;
+    this.lastDataTimestamp = null;
+    this.staleTimer = null;
+    
+    // fixture_id -> Set of listeners
+    this.fixtures = new Map();
+    // All state: "fixtureId:bookId:sideType" -> market data
+    this.state = new Map();
+  }
+
+  /** Register a fixture to watch. Returns an emitter for that fixture's updates. */
+  watch(fixtureId, sideNameMap) {
+    const emitter = new EventEmitter();
+    this.fixtures.set(fixtureId, { emitter, sideNameMap });
+    return emitter;
+  }
+
+  async connect() {
+    if (this.closed) return;
+    
+    // Initial REST snapshot
+    await this._pollREST();
+    
+    // Start single SSE
+    this._connectSSE();
+    
+    // REST polling supplement
+    this.pollTimer = setInterval(() => this._pollREST(), REST_POLL_INTERVAL);
+    
+    // Start stale detection
+    this.startStaleDetection();
+  }
+
+  async _connectSSE() {
+    if (this.closed) return;
+    
+    console.log('  [PD Shared SSE] Connecting...');
+    this.abortController = new AbortController();
+
+    try {
+      const res = await fetch(STREAM_URL, {
+        headers: {
+          'X-API-KEY': this.apiKey,
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+        },
+        signal: this.abortController.signal,
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+
+      console.log('  [PD Shared SSE] Connected ✅');
+      this.sseConnected = true;
+      this.reconnectDelay = RECONNECT_DELAY;
+      this.emit('connected');
+
+      await this._readStream(res.body);
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      console.error(`  [PD Shared SSE] Error: ${err.message}`);
+      this.sseConnected = false;
+      this._reconnect();
+    }
+  }
+
+  async _readStream(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const messages = buffer.split('\n\n');
+        buffer = messages.pop();
+
+        for (const message of messages) {
+          for (const line of message.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const record = JSON.parse(line.slice(6));
+              this._processRecord(record, true);
+            } catch {}
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.error(`  [PD Shared SSE] Stream error: ${err.message}`);
+      }
+    }
+
+    if (!this.closed) {
+      this.sseConnected = false;
+      this._reconnect();
+    }
+  }
+
+  _reconnect() {
+    if (this.closed) return;
+    console.log(`  [PD Shared SSE] Reconnecting in ${Math.round(this.reconnectDelay/1000)}s...`);
+    setTimeout(() => {
+      this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
+      this._connectSSE();
+    }, this.reconnectDelay);
+  }
+
+  async _pollREST() {
+    if (this.closed) return;
+    // Poll BOTH leagues — NCAAB and NBA
+    for (const league of ['NCAAB', 'NBA']) {
+      try {
+        const url = `${REST_URL}?league=${league}&bet_types=moneyline&periods=FT&book_ids=250`;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+
+        const res = await fetch(url, {
+          headers: { 'X-API-KEY': this.apiKey },
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (!res.ok) continue;
+
+        const data = await res.json();
+        const records = data.markets || data.data || (Array.isArray(data) ? data : []);
+
+        let count = 0;
+        for (const record of records) {
+          if (this._processRecord(record, false)) count++;
+        }
+
+        if (count > 0) {
+          console.log(`  [PD REST] Updated ${count} Pinnacle records (${league})`);
+        }
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          // silent
+        }
+      }
+    }
+  }
+
+  _processRecord(record, fromSSE) {
+    const fixtureId = String(record.fixture_id || '');
+    const bookId = record.odd_provider_id;
+    if (bookId !== 250) return false; // Pinnacle only
+    
+    const handler = this.fixtures.get(fixtureId);
+    if (!handler) return false; // Not watching this fixture
+    
+    const odds = parseFloat(record.odds);
+    if (!odds || odds <= 1) return false;
+    
+    const period = record.period || 'FT';
+    if (period !== 'FT') return false;
+    
+    const sideType = record.side_type || '';
+    const side = record.side || '';
+    const impliedProb = 1 / odds;
+    const now = Date.now();
+    
+    const key = `${fixtureId}:${sideType}`;
+    const prev = this.state.get(key);
+    
+    // Don't let stale REST overwrite live SSE
+    if (!fromSSE && prev && prev.fromSSE) return true;
+    
+    const resolvedName = handler.sideNameMap[sideType] || sideType;
+    
+    const entry = {
+      source: 'pinnacle',
+      bookId: 250,
+      side,
+      sideType,
+      name: resolvedName,
+      betType: 'moneyline',
+      decimalOdds: odds,
+      impliedProb,
+      isLive: record.is_live || false,
+      fromSSE,
+      timestamp: now,
+    };
+    
+    this.state.set(key, entry);
+    
+    // Update last data timestamp
+    this.lastDataTimestamp = now;
+    
+    // Emit to fixture-specific handler
+    if (!prev || prev.decimalOdds !== odds) {
+      handler.emitter.emit('price', entry);
+      this.emit('price', entry);
+    }
+    
+    return true;
+  }
+  
+  /** Start stale data detection */
+  startStaleDetection() {
+    if (this.staleTimer) return;
+    this.staleTimer = setInterval(() => this._checkStale(), 30000); // Check every 30s
+    console.log('  [PD Shared] Stale detection started');
+  }
+  
+  /** Check if data is stale */
+  _checkStale() {
+    if (!this.lastDataTimestamp) return;
+    
+    const age = Date.now() - this.lastDataTimestamp;
+    if (age > STALE_THRESHOLD_MS) {
+      console.warn(`  [PD Shared] ⚠️ DATA STALE: ${Math.round(age/1000)}s since last update`);
+      this.emit('stale', { age, lastUpdate: this.lastDataTimestamp });
+      
+      // Force REST poll as recovery
+      this._pollREST();
+    }
+  }
+  
+  /** Check if data is currently stale */
+  isStale() {
+    if (!this.lastDataTimestamp) return true;
+    return (Date.now() - this.lastDataTimestamp) > STALE_THRESHOLD_MS;
+  }
+  
+  /** Get age of last data in ms */
+  getDataAge() {
+    if (!this.lastDataTimestamp) return Infinity;
+    return Date.now() - this.lastDataTimestamp;
+  }
+
+  close() {
+    this.closed = true;
+    if (this.abortController) {
+      this.abortController.abort();
+    }
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+    }
+    if (this.staleTimer) {
+      clearInterval(this.staleTimer);
+    }
+  }
+}
+
+module.exports = { SharedPDClient, BOOK_NAMES };
+#!/usr/bin/env node
+/**
+ * LIVE FOK TRADER v2 — All-in-one
+ * 
+ * Features:
+ * 1. Real-time edge detection (Poly CLOB WS vs Pinnacle SSE)
+ * 2. FOK execution on Polymarket CLOB
+ * 3. Kelly criterion sizing (10% edge, 25% arb of CLOB balance)
+ * 4. On-chain position audit (CTF token balances, every 5 min)
+ * 5. Trade + arb alerts via notifications.jsonl → Telegram
+ * 6. Edge decay tracking (re-check 5m/30m after trade)
+ * 7. Proactive arb scanner (15s interval, both sides < $0.97)
+ * 8. Reactive arb lock (hedges existing positions when other side dips)
+ * 9. 72-hour resolution rule (no capital lockup in futures)
+ * 10. Scenario data logging (trade-scenarios.jsonl for analytics)
+ * 11. Stale Pinnacle detector (edge >30% + price <$0.30 = skip)
+ * 12. Dashboard output (dashboard.json)
+ */
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+// Load env FIRST — before any imports that read env vars
+require('dotenv').config();
+
+const { resolveGame, resolveAllGames, resolveBySlug, SPORT_CONFIG } = require('./src/game-resolver');
+const { PolymarketWS } = require('./src/polymarket-ws');
+const errorLog = require('./src/error-logger');
+const { SharedPDClient } = require('./src/predictiondata-shared');
+const { Executor } = require('./src/executor');
+const { GameTracker } = require('./src/game-tracker');
+const { logTrace, makeTraceId } = require('./src/trade-trace');
+const { ethers } = require('ethers');
+const fs = require('fs');
+const path = require('path');
+
+// Load centralized constants
+const C = require('./CONSTANTS');
+
+// Initialize game tracker
+const gameTracker = new GameTracker();
+gameTracker.load();
+
+// === CONSTANTS (using centralized) ===
+const ALCHEMY_RPC = process.env.ALCHEMY_RPC || C.ALCHEMY_RPC;
+const WALLET = C.WALLET;
+const USDC_E = C.USDC_E;
+const CTF_CONTRACT = C.CTF_CONTRACT;
+const CTF_EXCHANGE = C.CTF_EXCHANGE;
+
+// === ALERTS ===
+function sendAlert(type, message) {
+  const now = new Date();
+  const alert = {
+    time: now.toISOString(),
+    timeEST: now.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true }),
+    type,
+    message,
+  };
+  fs.appendFileSync('alerts.jsonl', JSON.stringify(alert) + '\n');
+  console.log(`[ALERT] ${message}`);
+  
+  // === TELEGRAM NOTIFICATION ===
+  // Notify group chat for: trades, arbs, redemptions, transfers, settlements
+  const notifyTypes = ['trade', 'arb', 'settle', 'redeem', 'transfer'];
+  if (notifyTypes.includes(type)) {
+    try {
+      // Write to notification queue file — Morgan's heartbeat picks these up
+      const nowN = new Date();
+      const notification = {
+        time: nowN.toISOString(),
+        timeEST: nowN.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true }),
+        type,
+        message,
+        sent: false,
+      };
+      fs.appendFileSync('notifications.jsonl', JSON.stringify(notification) + '\n');
+      
+      // === DIRECT TELEGRAM WEBHOOK ===
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      const chatId = process.env.TELEGRAM_CHAT_ID;
+      
+      if (botToken && chatId) {
+        const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+        fetch(telegramUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            chat_id: chatId, 
+            text: message,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          }),
+        }).catch(() => {}); // Silent fail
+      }
+    } catch (err) {
+      console.error('[Notify] Error:', err.message);
+    }
+  }
+}
+
+// === ON-CHAIN POSITION TRACKING ===
+async function checkOnChainPositions() {
+  try {
+    const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+    const ctf = new ethers.Contract(CTF_CONTRACT, ['function balanceOf(address,uint256) view returns (uint256)'], provider);
+    const usdc = new ethers.Contract(USDC_E, ['function balanceOf(address) view returns (uint256)'], provider);
+    
+    // Get all token IDs from executed orders
+    const tokenIds = new Set();
+    try {
+      const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+      for (const line of lines) {
+        try {
+          const order = JSON.parse(line);
+          if (order.tokenId && order.tokenId.length > 10) tokenIds.add(order.tokenId);
+        } catch {}
+      }
+    } catch {}
+    
+    const positions = [];
+    for (const tokenId of tokenIds) {
+      try {
+        const balance = await ctf.balanceOf(WALLET, tokenId);
+        const shares = parseFloat(ethers.utils.formatUnits(balance, 6));
+        if (shares > 0.01) {
+          // Check current price
+          let currentBid = null;
+          try {
+            const r = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+            const book = await r.json();
+            const bids = (book.bids || []).sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+            currentBid = bids[0] ? parseFloat(bids[0].price) : null;
+          } catch {}
+          
+          // Determine if position is active or resolved
+          let status = 'ACTIVE';
+          if (!currentBid || currentBid < 0.01) {
+            status = 'RESOLVED'; // Market closed, no bids
+          } else if (currentBid > 0.99) {
+            status = 'WON'; // Won position
+          }
+          
+          positions.push({ 
+            tokenId, 
+            shares, 
+            currentBid, 
+            value: currentBid ? shares * currentBid : null,
+            status
+          });
+        }
+      } catch {}
+    }
+    
+    // Get wallet + CLOB balances
+    const walletBal = parseFloat(ethers.utils.formatUnits(await usdc.balanceOf(WALLET), 6));
+    const polBal = parseFloat(ethers.utils.formatEther(await provider.getBalance(WALLET)));
+    
+    return { positions, walletUSDC: walletBal, pol: polBal, checkedAt: new Date().toISOString() };
+  } catch (err) {
+    console.error('[Position Check] Error:', err.message);
+    return null;
+  }
+}
+
+// === AUTO-DEPOSIT USDC.e TO CLOB ===
+async function autoDeposit() {
+  // DISABLED — raw transfer() to CTF Exchange does NOT credit CLOB balance
+  // Lost $26.51 on 2026-02-21 due to this bug. DO NOT RE-ENABLE without proper deposit method.
+  console.log('[Auto-Deposit] DISABLED (broken — use manual deposit via Polymarket UI)');
+}
+
+// === FUND TRANSFER SAFETY PROTOCOL ===
+// MANDATORY: Any fund movement MUST follow this exact sequence:
+// 1. Send test amount ($0.75-$0.99 USDC.e) first
+// 2. Verify on-chain the funds arrived at intended destination
+// 3. Ask human for confirmation (show proof)
+// 4. Only after human says go, send remaining funds using EXACT same method
+// 5. NEVER send full balance in one shot
+// This exists because auto-deposit burned $26.51 on 2026-02-21
+async function safeTransfer(signer, usdcContract, toAddress, totalAmount, description) {
+  const { ethers } = require('ethers');
+  
+  // Step 1: Test transfer
+  const testAmount = ethers.utils.parseUnits('0.85', 6); // $0.85 test
+  console.log(`\n🔒 SAFE TRANSFER: ${description}`);
+  console.log(`   Step 1: Sending $0.85 test to ${toAddress.substring(0,12)}...`);
+  
+  // Dynamic gas pricing
+  const feeData = await signer.provider.getFeeData();
+  const baseFee = feeData.lastBaseFeePerGas || ethers.utils.parseUnits('500', 'gwei');
+  const testTx = await usdcContract.transfer(toAddress, testAmount, {
+    maxFeePerGas: baseFee.mul(3),
+    maxPriorityFeePerGas: ethers.utils.parseUnits('50', 'gwei'),
+  });
+  await testTx.wait();
+  console.log(`   Step 1 TX: ${testTx.hash}`);
+  
+  // Step 2: Verify on-chain
+  const provider = signer.provider;
+  const recipientBal = await usdcContract.balanceOf(toAddress);
+  console.log(`   Step 2: Verified recipient balance: $${(parseInt(recipientBal)/1e6).toFixed(2)}`);
+  
+  // Step 3: STOP — require human confirmation
+  console.log(`   Step 3: ⛔ WAITING FOR HUMAN CONFIRMATION`);
+  console.log(`   Test of $0.85 confirmed at ${toAddress.substring(0,12)}`);
+  console.log(`   Remaining: $${(totalAmount - 0.85).toFixed(2)} to send`);
+  console.log(`   DO NOT PROCEED WITHOUT HUMAN APPROVAL`);
+  
+  sendAlert('transfer', `🔒 SAFE TRANSFER: $0.85 test sent to ${toAddress.substring(0,12)} for "${description}". Verified on-chain. Awaiting human confirmation to send remaining $${(totalAmount - 0.85).toFixed(2)}.`);
+  
+  // Return test result — caller must get human approval before calling sendRemaining()
+  return {
+    testTx: testTx.hash,
+    toAddress,
+    remaining: totalAmount - 0.85,
+    verified: true,
+    humanApproved: false, // MUST be set to true by human before proceeding
+  };
+}
+// NEVER bypass safeTransfer for ANY fund movement. Period.
+
+// === KELLY CRITERION SIZING ===
+function kellySize(edgePct, price, clobBalance) {
+  // edge = implied prob difference (e.g. 0.05 = 5%)
+  // Kelly: f = edge / (decimal_odds - 1) where decimal_odds = 1/price
+  const edge = edgePct / 100;
+  const decimalOdds = 1 / price;
+  const kelly = edge / (decimalOdds - 1);
+  
+  // Cap at 10% of CLOB balance, min $1, max $10
+  const maxBet = clobBalance * 0.10;
+  const bet = Math.max(1, Math.min(10, Math.min(kelly * clobBalance, maxBet)));
+  return parseFloat(bet.toFixed(2));
+}
+
+// === EDGE DECAY TRACKING ===
+const pendingDecayChecks = []; // { tokenId, tradeTime, entryEdge, entryPolyPrice, pinnacleImplied, team }
+
+async function checkEdgeDecay() {
+  const now = Date.now();
+  const remaining = [];
+  
+  for (const check of pendingDecayChecks) {
+    const elapsed = (now - check.tradeTime) / 60000; // minutes
+    
+    if (elapsed >= 5 && !check.checked5m) {
+      // 5-minute check
+      try {
+        const r = await fetch(`https://clob.polymarket.com/book?token_id=${check.tokenId}`);
+        const book = await r.json();
+        const asks = (book.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        const currentAsk = asks[0] ? parseFloat(asks[0].price) : null;
+        
+        check.checked5m = true;
+        check.price5m = currentAsk;
+        check.edge5m = currentAsk ? ((check.pinnacleImplied - currentAsk) * 100).toFixed(1) : null;
+        
+        console.log(`[Decay] ${check.team} @ 5m: ask $${currentAsk} (was $${check.entryPolyPrice}) | edge ${check.edge5m}% (was ${check.entryEdge}%)`);
+      } catch {}
+    }
+    
+    if (elapsed >= 30 && !check.checked30m) {
+      // 30-minute check
+      try {
+        const r = await fetch(`https://clob.polymarket.com/book?token_id=${check.tokenId}`);
+        const book = await r.json();
+        const asks = (book.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        const currentAsk = asks[0] ? parseFloat(asks[0].price) : null;
+        
+        check.checked30m = true;
+        check.price30m = currentAsk;
+        check.edge30m = currentAsk ? ((check.pinnacleImplied - currentAsk) * 100).toFixed(1) : null;
+        
+        console.log(`[Decay] ${check.team} @ 30m: ask $${currentAsk} | edge ${check.edge30m}%`);
+        
+        // Write to edge-decay.jsonl
+        fs.appendFileSync('edge-decay.jsonl', JSON.stringify(check) + '\n');
+      } catch {}
+    }
+    
+    // Keep until 30m check done
+    if (!check.checked30m) remaining.push(check);
+  }
+  
+  pendingDecayChecks.length = 0;
+  pendingDecayChecks.push(...remaining);
+}
+
+// === WIN RATE BY EDGE BUCKET ===
+function getEdgeBucketStats() {
+  const buckets = { '3-5%': { wins: 0, losses: 0 }, '5-7%': { wins: 0, losses: 0 }, '7-10%': { wins: 0, losses: 0 }, '10%+': { wins: 0, losses: 0 } };
+  
+  try {
+    const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+    for (const line of lines) {
+      try {
+        const order = JSON.parse(line);
+        if (!order.edge || !order.result) continue;
+        const edge = parseFloat(order.edge);
+        let bucket;
+        if (edge < 5) bucket = '3-5%';
+        else if (edge < 7) bucket = '5-7%';
+        else if (edge < 10) bucket = '7-10%';
+        else bucket = '10%+';
+        
+        if (order.result === 'WIN') buckets[bucket].wins++;
+        else if (order.result === 'LOSS') buckets[bucket].losses++;
+      } catch {}
+    }
+  } catch {}
+  
+  const result = {};
+  for (const [bucket, data] of Object.entries(buckets)) {
+    const total = data.wins + data.losses;
+    result[bucket] = { ...data, total, winRate: total > 0 ? (data.wins / total * 100).toFixed(1) + '%' : 'N/A' };
+  }
+  return result;
+}
+
+// === ON-CHAIN AUDIT ===
+// Verifies CLOB positions match our records — runs every 5 minutes
+async function auditPositions() {
+  try {
+    const { ethers } = require('ethers');
+    const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+    const CTF = new ethers.Contract('0x4D97DCd97eC945f40cF65F87097ACe5EA0476045', [
+      'function balanceOf(address,uint256) view returns (uint256)',
+    ], provider);
+    
+    // Load all token IDs we've traded
+    const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+    const tokenMap = new Map();
+    for (const line of lines) {
+      try {
+        const o = JSON.parse(line);
+        if (o.tokenId && o.tokenId.length > 20 && (o.status === 'delayed' || o.status === 'LIVE' || o.status === 'MATCHED')) {
+          if (!tokenMap.has(o.tokenId)) {
+            tokenMap.set(o.tokenId, { team: o.team, game: o.game, expected: 0 });
+          }
+          tokenMap.get(o.tokenId).expected += o.size;
+        }
+      } catch {}
+    }
+    
+    // Verify on-chain
+    const audit = {
+      timestamp: new Date().toISOString(),
+      discrepancies: [],
+      positions: [],
+      totalOnChain: 0,
+      totalExpected: 0,
+    };
+    
+    for (const [tokenId, data] of tokenMap) {
+      const balance = await CTF.balanceOf(WALLET, tokenId);
+      const onChainShares = parseFloat(ethers.utils.formatUnits(balance, 6));
+      const expected = data.expected;
+      
+      audit.totalOnChain += onChainShares;
+      audit.totalExpected += expected;
+      
+      if (Math.abs(onChainShares - expected) > 0.01) {
+        // Only flag as discrepancy if on-chain > 0 (unexpected shares)
+        // or expected > 0 and on-chain is 0 for the FIRST time (then auto-clear)
+        if (onChainShares > 0.01) {
+          // We have shares we didn't expect — real discrepancy
+          audit.discrepancies.push({
+            tokenId, team: data.team, game: data.game,
+            expected, onChain: onChainShares, diff: onChainShares - expected,
+          });
+        }
+        // If on-chain is 0 but expected > 0, position was redeemed/resolved — not a problem
+        // Just log it quietly
+      }
+      
+      audit.positions.push({
+        tokenId: tokenId,
+        team: data.team,
+        expected,
+        onChain: onChainShares,
+      });
+    }
+    
+    // Log audit
+    fs.appendFileSync('audit.log', JSON.stringify(audit) + '\n');
+    
+    if (audit.discrepancies.length > 0) {
+      console.error(`\n❌ AUDIT ALERT: ${audit.discrepancies.length} discrepancies found:`);
+      for (const d of audit.discrepancies) {
+        console.error(`   ${d.team}: expected ${d.expected.toFixed(2)}, on-chain ${d.onChain.toFixed(2)} (diff: ${d.diff.toFixed(2)})`);
+      }
+      sendAlert('audit', `⚠️ AUDIT ALERT: ${audit.discrepancies.length} position mismatches detected`);
+    } else {
+      console.log(`\n✅ AUDIT PASS: ${audit.positions.length} positions, ${audit.totalOnChain.toFixed(2)} shares total`);
+    }
+    
+    return audit;
+  } catch (err) {
+    console.error('[Audit] Error:', err.message);
+    return null;
+  }
+}
+
+// === DASHBOARD ===
+function saveDashboard(executor, chainData, auditData) {
+  // Filter out dead/resolved positions with $0 value for cleaner UI
+  let filteredChainData = chainData;
+  if (chainData && chainData.positions) {
+    filteredChainData = {
+      ...chainData,
+      positions: chainData.positions.filter(p => 
+        p.status === 'ACTIVE' || 
+        (p.value && parseFloat(p.value) > 0.01) ||
+        p.status === 'WON (redeem!)'
+      )
+    };
+    
+    const hidden = chainData.positions.length - filteredChainData.positions.length;
+    if (hidden > 0) {
+      console.log(`[Dashboard] Filtered ${hidden} resolved dead positions`);
+    }
+  }
+  
+  const dashboard = {
+    lastUpdated: new Date().toISOString(),
+    real: executor ? executor.getStatus() : {},
+    onChain: filteredChainData || null,
+    audit: auditData || null,
+    edgeBuckets: getEdgeBucketStats(),
+    realTrades: [],
+  };
+  
+  try {
+    const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+    dashboard.realTrades = lines.slice(-30).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch {}
+  
+  fs.writeFileSync('dashboard.json', JSON.stringify(dashboard, null, 2));
+}
+
+// Strategy
+// === TRADING STRATEGY (using centralized) ===
+const STRATEGY = C.STRATEGY;
+
+// Track CLOB balance for Kelly sizing
+let clobBalance = 30; // Will be updated on startup
+
+class Trader {
+  constructor(game, strategy, executor) {
+    this.game = game;
+    this.strategy = strategy;
+    this.executor = executor;
+    this.label = `${game.teams.away} @ ${game.teams.home}`;
+    this.tokenState = new Map();
+    this.bookState = new Map();
+  }
+
+  onPolyUpdate(update) {
+    const tokenId = update.tokenId;
+    if (!this.tokenState.has(tokenId)) {
+      this.tokenState.set(tokenId, {
+        name: update.name, tokenId, prices: [], ema: null,
+        trades: 0, lastTradeTime: 0, liveBestAsk: null, liveBestBid: null,
+      });
+    }
+    const state = this.tokenState.get(tokenId);
+    if (update.bestAsk && update.bestAsk > 0) state.liveBestAsk = update.bestAsk;
+    if (update.bestBid && update.bestBid > 0) state.liveBestBid = update.bestBid;
+    const price = update.midpoint || update.bestAsk || update.lastTrade;
+    if (!price || price <= 0) return;
+    state.prices.push({ t: Date.now(), p: price });
+    if (state.prices.length > 100) state.prices.shift();
+    if (state.ema === null) state.ema = price;
+    else state.ema = this.strategy.emaAlpha * price + (1 - this.strategy.emaAlpha) * state.ema;
+    this.checkSignal(state);
+    this.checkSellSignal(state); // Feature 4: Sell-side edge detection
+  }
+
+  onBookUpdate(update) {
+    this.bookState.set(update.name, { impliedProb: update.impliedProb, source: update.source });
+  }
+
+  async checkSignal(state) {
+    if (state.prices.length < 10) return;
+    
+    const currentPrice = state.prices[state.prices.length - 1].p;
+    
+    // === VIG-ADJUSTED EDGE CALCULATION ===
+    // Use Pinnacle fair prob (vig-removed) as truth, not EMA
+    const bookData = this.bookState.get(state.name);
+    let pinnacleRaw = bookData ? bookData.impliedProb : null;
+    
+    // Get the other side's Pinnacle prob to calculate vig
+    let otherRaw = null;
+    for (const [name, data] of this.bookState) {
+      if (name !== state.name) { otherRaw = data.impliedProb; break; }
+    }
+    
+    // === STALE PINNACLE DETECTOR ===
+    // If edge > 30% AND price < $0.30, Pinnacle data is likely stale
+    if (pinnacleRaw) {
+      const rawEdge = (pinnacleRaw - currentPrice) * 100;
+      if (rawEdge > 30 && currentPrice < 0.30) {
+        console.log(`[STALE SKIP] ${state.name} — ${rawEdge.toFixed(1)}% raw edge @ $${currentPrice.toFixed(2)} (likely stale Pinnacle)`);
+        return;
+      }
+    }
+    
+    let fairProb;
+    if (pinnacleRaw && otherRaw) {
+      // Vig-adjust: divide by total book
+      const totalBook = pinnacleRaw + otherRaw;
+      fairProb = pinnacleRaw / totalBook;
+    } else if (pinnacleRaw) {
+      // No other side available, estimate vig at ~5%
+      fairProb = pinnacleRaw / 1.05;
+    } else {
+      // No Pinnacle data at all — fall back to EMA
+      fairProb = state.ema;
+    }
+    
+    // Must be in favorite range (65-85% fair prob)
+    if (fairProb < this.strategy.minProb || fairProb > this.strategy.maxProb) return;
+    
+    // Edge = fair prob - poly ask price
+    const edge = (fairProb - currentPrice) * 100;
+    
+    // Feature 7: Log ALL edges > 1% (even if not traded) for histogram analysis
+    if (edge > 1.0) {
+      // Signal-level observation only (NOT execution)
+      logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false);
+    }
+    
+    if (edge < this.strategy.edgeThreshold) return;
+
+    const traceId = makeTraceId(state.name, this.label);
+    logTrace(traceId, 'signal.qualified', 'info', {
+      team: state.name,
+      game: this.label,
+      sport: this.game.sport,
+      edge: Number(edge.toFixed(2)),
+      currentPrice,
+      fairProb,
+      threshold: this.strategy.edgeThreshold,
+    });
+
+    // === FIX 0: No buying both sides of same game via edge signals ===
+    // Check if we already hold the OTHER side of this game
+    for (const [tid, pos] of openPositions) {
+      if (pos.game === this.label && tid !== state.tokenId && !pos.hedged) {
+        const reason = `already_holding_other_side:${pos.team}`;
+        console.log(`[SKIP] ${state.name} — already hold other side (${pos.team}) in ${this.label}`);
+        logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+        logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+          currentPrice, fairProb, edge, heldOtherSide: pos.team, tokenId: state.tokenId,
+        });
+        return;
+      }
+    }
+
+    // === 72-HOUR RESOLUTION RULE (edge trades) ===
+    const edgeEndDate = this.game.polymarket?.endDate;
+    if (edgeEndDate) {
+      const hoursUntil = (new Date(edgeEndDate).getTime() - Date.now()) / 3600000;
+      if (hoursUntil > 72) {
+        const reason = `resolution_gt_72h:${hoursUntil.toFixed(0)}h`;
+        console.log(`[SKIP] ${state.name} — resolves in ${hoursUntil.toFixed(0)}h (>72h limit)`);
+        logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+        logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+          currentPrice, fairProb, edge, hoursUntilResolve: Number(hoursUntil.toFixed(2)), endDate: edgeEndDate,
+        });
+        return;
+      }
+    }
+
+    // === FIX 1: Hard price floor — no EDGE buys under $0.15 ===
+    // Tokens under $0.15 = game likely decided, Pinnacle data is stale
+    // NOTE: Arb scanner uses $0.05 floor (arbs are guaranteed regardless)
+    if (currentPrice < 0.15) {
+      const reason = `price_floor_lt_0.15:${currentPrice.toFixed(3)}`;
+      console.log(`[SKIP] ${state.name} @ $${currentPrice.toFixed(3)} — below $0.15 floor (game likely decided)`);
+      logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+      logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+        currentPrice, fairProb, edge, floor: 0.15,
+      });
+      return;
+    }
+
+    // === FIX 2: Polymarket price as game clock proxy ===
+    // If token dropped >50% from initial price, game is deep in progress
+    // Combined with huge "edge" (>30%), Pinnacle is almost certainly stale
+    if (edge > 30 && currentPrice < 0.30) {
+      const reason = `stale_late_game_guard:edge_${edge.toFixed(1)}_price_${currentPrice.toFixed(3)}`;
+      console.log(`[SKIP] ${state.name} @ $${currentPrice.toFixed(3)} — edge ${edge.toFixed(1)}% too large + price too low (stale Pinnacle)`);
+      logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+      logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+        currentPrice, fairProb, edge, staleGuardEdgeThreshold: 30, staleGuardPriceThreshold: 0.30,
+      });
+      return;
+    }
+
+    // === FIX 3: Game clock logging (no cutoff — stale detector + price floor handle late games) ===
+    const gameStartTime = this.game.polymarket?.startTime || this.game.predictionData?.fixture?.start_time;
+    // No time cutoff. Stale Pinnacle detector (edge>30% + price<$0.30) and price floor ($0.15) catch bad late-game signals.
+
+    if (this.strategy.requireBounce && state.prices.length >= 5) {
+      const recent = state.prices.slice(-5);
+      const recentLow = Math.min(...recent.map(p => p.p));
+
+      // Less strict anti-falling-knife:
+      // only reject when we're near the 5-tick low AND short-term trend is still down.
+      const nearLow = currentPrice <= recentLow * 1.001; // within ~0.1% of low
+      const last3 = recent.slice(-3).map(p => p.p);
+      const downtrend = last3.length === 3 && last3[2] <= last3[1] && last3[1] <= last3[0];
+
+      if (nearLow && downtrend) {
+        const reason = `require_bounce_not_met:price_${currentPrice.toFixed(3)}_recentLow_${recentLow.toFixed(3)}_downtrend`;
+        console.log(`[SKIP] ${state.name} — bounce not met (near low + downtrend)`);
+        logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+        logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+          currentPrice, recentLow, fairProb, edge, requireBounce: true, nearLow, downtrend, last3,
+        });
+        return;
+      }
+    }
+
+    if (state.trades >= this.strategy.maxTrades) {
+      const reason = `max_trades_reached:${state.trades}/${this.strategy.maxTrades}`;
+      console.log(`[SKIP] ${state.name} — max trades reached (${state.trades}/${this.strategy.maxTrades})`);
+      logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+      logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+        currentPrice, fairProb, edge, stateTrades: state.trades, maxTrades: this.strategy.maxTrades,
+      });
+      return;
+    }
+
+    if (!state.liveBestAsk) {
+      const reason = 'missing_liveBestAsk';
+      console.log(`[SKIP] ${state.name} — missing live best ask`);
+      logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+      logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+        currentPrice, fairProb, edge, liveBestAsk: state.liveBestAsk,
+      });
+      return;
+    }
+    if (state.liveBestAsk >= this.strategy.hardMaxPrice) {
+      const reason = `hard_max_price_exceeded:${state.liveBestAsk.toFixed(3)}>=${this.strategy.hardMaxPrice}`;
+      console.log(`[SKIP] ${state.name} - price $${state.liveBestAsk.toFixed(3)} exceeds max $${this.strategy.hardMaxPrice}`);
+      logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+      logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+        currentPrice, liveBestAsk: state.liveBestAsk, fairProb, edge, hardMaxPrice: this.strategy.hardMaxPrice,
+      });
+      return;
+    }
+
+    // Late-game check moved to earlier in checkSignal (FIX 3)
+
+    // Pinnacle fair prob (vig-adjusted) already calculated above
+    const pinnacleImplied = fairProb;
+
+    // Find conditionId
+    let conditionId = null;
+    for (const market of this.game.polymarket.markets) {
+      for (const outcome of market.outcomes) {
+        if (outcome.tokenId === state.tokenId) { conditionId = market.conditionId; break; }
+      }
+      if (conditionId) break;
+    }
+
+    // === KELLY SIZING ===
+    const betSize = kellySize(edge, state.liveBestAsk, clobBalance);
+    
+    state.trades++;
+    state.lastTradeTime = Date.now();
+
+    const signal = {
+      tokenId: state.tokenId, conditionId, team: state.name,
+      price: state.liveBestAsk, edge: edge.toFixed(1),
+      direction: 'BUY_POLY', game: this.label, sport: this.game.sport,
+      traceId,
+    };
+
+    // Override executor bet size with Kelly
+    this.executor.betSize = betSize;
+
+    // Log vig-adjusted info
+    const bookInfo = bookData ? ` | Pinnacle fair: ${(pinnacleImplied * 100).toFixed(1)}%` : '';
+    console.log(`\n🎯 EDGE: ${state.name} @ $${state.liveBestAsk.toFixed(3)} | vig-adj edge ${edge.toFixed(1)}% | Kelly $${betSize} | ${this.label}${bookInfo}`);
+
+    try {
+      logTrace(traceId, 'signal.dispatch_executor', 'info', { betSize, ask: state.liveBestAsk, edge: Number(edge.toFixed(2)) });
+      const result = await this.executor.execute(signal);
+      if (!result) {
+        const reason = 'executor_rejected_or_failed';
+        console.log(`   ❌ EDGE NOT EXECUTED: ${state.name} | ${reason}`);
+        logTrace(traceId, 'signal.rejected', 'rejected', { reason });
+        logEdgeSeen(state.name, this.label, this.game.sport, edge, currentPrice, fairProb, false, reason, {
+          currentPrice, fairProb, edge, traceId,
+        });
+        return;
+      }
+      if (result) {
+        console.log(`   ✅ FOK: ${result.status} | ${result.side} ${result.size} @ $${result.price} = $${result.cost}`);
+        logTrace(traceId, 'signal.executed', 'success', { orderId: result.orderId, status: result.status, cost: result.cost, size: result.size, price: result.price });
+        // Execution-level confirmation (actual filled/accepted trade)
+        logEdgeSeen(state.name, this.label, this.game.sport, edge, result.price || currentPrice, fairProb, true);
+        
+        // Register for arb lock scanning — find the other side's tokenId
+        let otherTokenId = null;
+        for (const market of this.game.polymarket.markets) {
+          for (const outcome of market.outcomes) {
+            if (outcome.tokenId && outcome.tokenId !== state.tokenId) {
+              otherTokenId = outcome.tokenId;
+              break;
+            }
+          }
+          if (otherTokenId) break;
+        }
+        registerPosition(state.tokenId, state.name, this.label, state.liveBestAsk, otherTokenId, conditionId, result.size);
+        
+        // === SCENARIO DATA LOGGING ===
+        // Save everything we can about this trade for historical analysis
+        const gameStartTime = this.game.polymarket?.startTime || this.game.predictionData?.fixture?.start_time;
+        const minutesIntoGame = gameStartTime ? ((Date.now() - new Date(gameStartTime).getTime()) / 60000).toFixed(1) : null;
+        
+        // Get other side's price for spread analysis
+        let otherAskPrice = null;
+        if (otherTokenId) {
+          try {
+            const otherBook = await fetch('https://clob.polymarket.com/book?token_id=' + otherTokenId).then(r => r.json());
+            const otherAsks = (otherBook.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+            otherAskPrice = otherAsks[0] ? parseFloat(otherAsks[0].price) : null;
+          } catch {}
+        }
+        
+        // Pinnacle raw data
+        const bookRaw = bookData || {};
+        const vigTotal = bookRaw.pinnacleA && bookRaw.pinnacleB ? (bookRaw.pinnacleA + bookRaw.pinnacleB) : null;
+        
+        const scenario = {
+          timestamp: new Date().toISOString(),
+          // Trade info
+          team: state.name,
+          game: this.label,
+          sport: this.game.sport,
+          side: 'BUY',
+          entryPrice: result.price,
+          shares: result.size,
+          cost: parseFloat(result.cost),
+          tokenId: state.tokenId,
+          orderId: result.orderId,
+          // Edge data
+          edge: parseFloat(edge.toFixed(2)),
+          pinnacleImplied: pinnacleImplied ? parseFloat((pinnacleImplied * 100).toFixed(2)) : null,
+          pinnacleRaw: bookRaw.pinnacleA || null,
+          vigTotal: vigTotal ? parseFloat(vigTotal.toFixed(4)) : null,
+          // Market state at entry
+          polyAsk: state.liveBestAsk,
+          polyBid: state.liveBestBid || null,
+          otherSideAsk: otherAskPrice,
+          combinedAsks: otherAskPrice ? parseFloat((state.liveBestAsk + otherAskPrice).toFixed(4)) : null,
+          spread: state.liveBestAsk && state.liveBestBid ? parseFloat((state.liveBestAsk - state.liveBestBid).toFixed(4)) : null,
+          // Game state
+          minutesIntoGame: minutesIntoGame ? parseFloat(minutesIntoGame) : null,
+          gameStartTime: gameStartTime || null,
+          polymarketEndDate: this.game.polymarket?.endDate || null,
+          // Sizing
+          kellyBetSize: betSize,
+          kellyClobBalance: clobBalance,
+          kellyPctOfBankroll: parseFloat((betSize / clobBalance * 100).toFixed(2)),
+          // Market metadata
+          polymarketVolume: this.game.polymarket?.volume24hr || null,
+          polymarketLiquidity: this.game.polymarket?.liquidity || null,
+          // Arb potential at entry
+          arbPossibleAtEntry: otherAskPrice ? (state.liveBestAsk + otherAskPrice < ARB_THRESHOLD) : false,
+          // Result fields — filled in later by settlement tracker
+          result: null, // 'win' | 'loss'
+          exitPrice: null,
+          pnl: null,
+          settledAt: null,
+        };
+        fs.appendFileSync('trade-scenarios.jsonl', JSON.stringify(scenario) + '\n');
+        
+        // Alert with full reasoning
+        const kellyInfo = `Kelly: $${betSize} (${(betSize/clobBalance*100).toFixed(1)}% of $${clobBalance.toFixed(0)})`;
+        const reasoning = `Pinnacle fair ${(pinnacleImplied * 100).toFixed(1)}% vs Poly ask $${result.price} = ${edge.toFixed(1)}% edge. ${kellyInfo}`;
+        sendAlert('trade', `🎯 TRADE: BUY ${state.name} @ $${result.price} | ${result.size} shares ($${result.cost}) | ${this.label}\n📊 ${reasoning}`);
+        
+        // Edge decay tracking
+        pendingDecayChecks.push({
+          tokenId: state.tokenId, tradeTime: Date.now(), entryEdge: edge.toFixed(1),
+          entryPolyPrice: state.liveBestAsk, pinnacleImplied: pinnacleImplied || state.ema,
+          team: state.name, game: this.label,
+        });
+      }
+    } catch (err) {
+      logTrace(traceId, 'signal.exception', 'failed', { error: err.message });
+      console.error(`   ❌ Error: ${err.message}`);
+    }
+    
+    saveDashboard(this.executor, lastChainData);
+  }
+
+  // === FEATURE 4: SELL-SIDE EDGE DETECTION ===
+  // If Poly bid > Pinnacle fair prob, we can sell (short) existing positions
+  async checkSellSignal(state) {
+    if (!state.liveBestBid || state.liveBestBid <= 0) return;
+    
+    const bookData = this.bookState.get(state.name);
+    if (!bookData) return;
+    
+    let pinnacleRaw = bookData.impliedProb;
+    let otherRaw = null;
+    for (const [name, data] of this.bookState) {
+      if (name !== state.name) { otherRaw = data.impliedProb; break; }
+    }
+    
+    let fairProb;
+    if (pinnacleRaw && otherRaw) {
+      fairProb = pinnacleRaw / (pinnacleRaw + otherRaw);
+    } else return;
+    
+    // Sell edge: Poly bid > fair prob (market overpricing this outcome)
+    const sellEdge = (state.liveBestBid - fairProb) * 100;
+    if (sellEdge < this.strategy.edgeThreshold) return;
+
+    // We can only sell if we hold this position
+    const pos = openPositions.get(state.tokenId);
+    if (!pos || pos.hedged) return; // Don't sell arb-locked positions
+
+    // Only auto-take-profit pregame
+    const gameStatus = this.game?.predictionData?.fixture?.status;
+    if (gameStatus === 'inprogress') return;
+
+    // Hard gate: require >=15% NET expected return after fees
+    const estRoundTripFeePct = 1.0; // conservative fee estimate
+    const grossPct = ((state.liveBestBid - pos.entryPrice) / pos.entryPrice) * 100;
+    const netPct = grossPct - estRoundTripFeePct;
+
+    // Log for histogram/trace
+    const rejectReason = netPct >= 15 ? null : `sell_net_lt_15:gross_${grossPct.toFixed(2)}_net_${netPct.toFixed(2)}`;
+    logEdgeSeen(state.name + ' (SELL)', this.label, this.game.sport, sellEdge, state.liveBestBid, fairProb, false, rejectReason, {
+      bid: state.liveBestBid,
+      fairProb,
+      sellEdge,
+      entryPrice: pos.entryPrice,
+      grossPct: Number(grossPct.toFixed(2)),
+      netPct: Number(netPct.toFixed(2)),
+      feePct: estRoundTripFeePct,
+      gameStatus,
+      shares: pos.shares,
+    });
+
+    if (netPct < 15) return;
+
+    console.log(`\n📉 AUTO SELL: ${state.name} bid $${state.liveBestBid.toFixed(3)} | gross ${grossPct.toFixed(1)}% | net ${netPct.toFixed(1)}% | ${this.label}`);
+
+    const sellSignal = {
+      tokenId: state.tokenId,
+      conditionId: pos.conditionId,
+      team: state.name,
+      price: state.liveBestBid,
+      edge: netPct.toFixed(1),
+      direction: 'SELL_POLY',
+      game: this.label,
+      sport: this.game.sport,
+      strategy: 'take_profit_sell',
+      size: Math.max(5, Math.floor(pos.shares || 0)),
+    };
+
+    const result = await this.executor.execute(sellSignal);
+    if (result && result.status !== 'FAILED' && result.status !== 'EXPIRED') {
+      openPositions.delete(state.tokenId);
+      savePositions();
+      sendAlert('trade', `✅ SELL EXECUTED: ${state.name} @ $${result.price} | ${result.size} shares | gross ${grossPct.toFixed(1)}% | net ${netPct.toFixed(1)}% | ${this.label}`);
+    }
+  }
+}
+
+let lastChainData = null;
+
+// === ARB LOCK — Guaranteed Profit Hedger ===
+// Tracks open positions and buys the other side when combined cost < $0.97 (3%+ guaranteed return)
+const ARB_THRESHOLD = 0.92; // Hedge/arb only when lock is strong (>=8% guaranteed)
+
+// Position persistence using JSON file (simple, reliable)
+const POSITIONS_FILE = './positions.json';
+let openPositions = new Map(); // tokenId -> { team, game, entryPrice, otherTokenId, conditionId }
+
+function loadPositions() {
+  try {
+    if (fs.existsSync(POSITIONS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(POSITIONS_FILE, 'utf-8'));
+      openPositions = new Map(Object.entries(data));
+      console.log(`[Positions] Loaded ${openPositions.size} positions from disk`);
+    }
+  } catch (e) {
+    console.error('[Positions] Failed to load:', e.message);
+    openPositions = new Map();
+  }
+}
+
+function savePositions() {
+  try {
+    const data = Object.fromEntries(openPositions);
+    fs.writeFileSync(POSITIONS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('[Positions] Failed to save:', e.message);
+  }
+}
+
+function registerPosition(tokenId, team, game, entryPrice, otherTokenId, conditionId, shares) {
+  openPositions.set(tokenId, { team, game, entryPrice, otherTokenId, conditionId, hedged: false, shares: shares || 5, hedgedShares: 0, lastHedgeAttempt: 0, entryTime: Date.now(), agingAlerted: false });
+  savePositions(); // Persist immediately
+}
+
+// === CIRCUIT BREAKER ===
+// Halt trading if drawdown from peak exceeds 50%
+const PEAK_BALANCE_FILE = 'peak-balance.json';
+let peakBalance = 0;
+
+function loadPeakBalance() {
+  try {
+    if (fs.existsSync(PEAK_BALANCE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PEAK_BALANCE_FILE, 'utf-8'));
+      peakBalance = data.peak || 0;
+      console.log(`[Circuit Breaker] Loaded peak balance: $${peakBalance.toFixed(2)}`);
+    }
+  } catch (err) {
+    console.log('[Circuit Breaker] No saved peak balance, will calculate from current');
+    peakBalance = 0;
+  }
+}
+
+function savePeakBalance() {
+  try {
+    fs.writeFileSync(PEAK_BALANCE_FILE, JSON.stringify({ peak: peakBalance, updated: Date.now() }, null, 2));
+  } catch (err) {
+    console.error('[Circuit Breaker] Failed to save peak balance:', err.message);
+  }
+}
+
+async function checkCircuitBreaker() {
+  try {
+    // Get current USDC balance (wallet + CLOB)
+    const { ethers } = require('ethers');
+    const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+    const usdc = new ethers.Contract(USDC_E, ['function balanceOf(address) view returns (uint256)'], provider);
+    const walletBal = await usdc.balanceOf(WALLET);
+    const walletUSDC = parseFloat(ethers.utils.formatUnits(walletBal, 6));
+    
+    // Add CLOB balance + open position value (self-heal against false CB trips)
+    let clobUSDC = 0;
+    let positionsValue = 0;
+
+    try {
+      const { ClobClient } = require('@polymarket/clob-client');
+      const signer = new ethers.Wallet(process.env.PRIVATE_KEY);
+      const creds = JSON.parse(fs.readFileSync('.api-creds.json', 'utf-8'));
+      const client = new ClobClient('https://clob.polymarket.com', 137, signer, creds, 0, signer.address);
+      const bal = await client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+      clobUSDC = parseInt(bal.balance) / 1e6;
+    } catch {}
+
+    try {
+      const chain = await checkOnChainPositions();
+      if (chain?.positions?.length) {
+        positionsValue = chain.positions.reduce((s, p) => s + (p.value || 0), 0);
+      }
+      lastChainData = chain || lastChainData;
+    } catch {}
+
+    const currentBalance = walletUSDC + clobUSDC + positionsValue;
+
+    // Self-heal: avoid false circuit-breaker trips when valuation sources are temporarily unavailable
+    if (positionsValue <= 0.01 && openPositions.size > 0) {
+      console.log(`[Circuit Breaker] Valuation degraded (positions on books: ${openPositions.size}). Skipping halt this cycle.`);
+      return { drawdown: 0, drawdownPercent: 0, currentBalance, peakBalance: peakBalance || currentBalance };
+    }
+    
+    // Update peak balance
+    if (currentBalance > peakBalance) {
+      peakBalance = currentBalance;
+      savePeakBalance();
+      console.log(`[Circuit Breaker] New peak balance: $${peakBalance.toFixed(2)}`);
+    }
+    
+    // If no peak recorded yet, set current as peak
+    if (peakBalance === 0) {
+      peakBalance = currentBalance;
+      savePeakBalance();
+      console.log(`[Circuit Breaker] Initial peak balance set: $${peakBalance.toFixed(2)}`);
+    }
+    
+    // Calculate drawdown percentage
+    const drawdown = peakBalance > 0 ? (peakBalance - currentBalance) / peakBalance : 0;
+    const drawdownPercent = drawdown * 100;
+    
+    console.log(`[Circuit Breaker] Current: $${currentBalance.toFixed(2)} | Peak: $${peakBalance.toFixed(2)} | Drawdown: ${drawdownPercent.toFixed(1)}%`);
+    
+    return { drawdown, drawdownPercent, currentBalance, peakBalance };
+  } catch (err) {
+    console.error('[Circuit Breaker] Error:', err.message);
+    return { drawdown: 0, drawdownPercent: 0, currentBalance: 0, peakBalance: 0 };
+  }
+}
+
+// === PROACTIVE ARB SCANNER ===
+// Scans ALL monitored games for arb opportunities (both sides ask < $0.97)
+// This is the PRIMARY strategy — guaranteed profit on every trade
+const arbScannedGames = new Set(); // Track games already arb'd
+let arbRejectStats = {
+  runs: 0,
+  missingAsks: 0,
+  lowLiquidity: 0,
+  priceFloor: 0,
+  thresholdMiss: 0,
+  lowArbPct: 0,
+  over72h: 0,
+  minShares: 0,
+  found: 0,
+};
+
+async function scanProactiveArbs(allTraders, executor) {
+  arbRejectStats.runs++;
+  for (const { game, trader } of allTraders) {
+    const label = `${game.teams.away} @ ${game.teams.home}`;
+    if (arbScannedGames.has(label)) continue; // Already FULLY arb'd this game (both sides bought)
+    
+    // Check if we already hold one side — if so, use the REACTIVE arb scanner path
+    // which checks our entry price, not current ask
+    let alreadyHeld = false;
+    for (const [tid, pos] of openPositions) {
+      if (pos.game === label && !pos.hedged) {
+        alreadyHeld = true;
+        break;
+      }
+    }
+    // If we hold one side, the reactive scanner (scanArbLocks) handles it every 60s
+    // But we ALSO check here with current asks in case our entry was cheaper
+    
+    // Get all token pairs for this game
+    for (const market of game.polymarket.markets) {
+      const outcomes = market.outcomes || [];
+      if (outcomes.length !== 2) continue;
+      
+      const tokenA = outcomes[0]?.tokenId;
+      const tokenB = outcomes[1]?.tokenId;
+      if (!tokenA || !tokenB) continue;
+      
+      try {
+        // Fetch both orderbooks simultaneously
+        const [bookA, bookB] = await Promise.all([
+          fetch('https://clob.polymarket.com/book?token_id=' + tokenA).then(r => r.json()),
+          fetch('https://clob.polymarket.com/book?token_id=' + tokenB).then(r => r.json()),
+        ]);
+        
+        const asksA = (bookA.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        const asksB = (bookB.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        
+        const askA = asksA[0] ? parseFloat(asksA[0].price) : null;
+        const askB = asksB[0] ? parseFloat(asksB[0].price) : null;
+        const sizeA = asksA[0] ? parseFloat(asksA[0].size) : 0;
+        const sizeB = asksB[0] ? parseFloat(asksB[0].size) : 0;
+        
+        if (!askA || !askB) { arbRejectStats.missingAsks++; continue; }
+        if (sizeA < 5 || sizeB < 5) { arbRejectStats.lowLiquidity++; continue; } // Need liquidity on both sides
+        if (askA < 0.05 || askB < 0.05) { arbRejectStats.priceFloor++; continue; } // $0.05 floor for arbs
+        
+        const totalCost = askA + askB;
+        if (totalCost >= ARB_THRESHOLD) { arbRejectStats.thresholdMiss++; continue; } // Not an arb
+        
+        // NO late-game cutoff for arbs — guaranteed profit regardless of game clock
+        
+        // === 72-HOUR RESOLUTION RULE ===
+        // Only arb on markets that resolve within 72 hours (no capital lockup)
+        const endDate = market.endDate || game.polymarket?.endDate;
+        if (endDate) {
+          const resolveTime = new Date(endDate).getTime();
+          const hoursUntilResolve = (resolveTime - Date.now()) / 3600000;
+          if (hoursUntilResolve > 72) {
+            arbRejectStats.over72h++;
+            console.log(`[ARB SKIP] ${label} — resolves in ${hoursUntilResolve.toFixed(0)}h (>72h limit)`);
+            continue;
+          }
+        }
+        
+        // Require stronger arb only: >=15% guaranteed
+        const guaranteedPct = (1 - totalCost) * 100;
+        if (guaranteedPct < 15) { arbRejectStats.lowArbPct++; continue; }
+
+        // === FOUND AN ARB ===
+        const profit = guaranteedPct.toFixed(1);
+        const nameA = outcomes[0].name || 'Side A';
+        const nameB = outcomes[1].name || 'Side B';
+        
+        arbRejectStats.found++;
+        console.log(`\n🔒 PROACTIVE ARB FOUND: ${label}`);
+        console.log(`   ${nameA}: ask $${askA} (size: ${sizeA})`);
+        console.log(`   ${nameB}: ask $${askB} (size: ${sizeB})`);
+        console.log(`   Total: $${totalCost.toFixed(3)} → Guaranteed ${profit}% profit`);
+        
+        // Size by guaranteed arb % of bankroll (requested behavior)
+        // Example: 32% guaranteed arb => deploy ~32% of available funds
+        const maxByLiquidity = Math.min(sizeA, sizeB);
+        const bankrollFrac = Math.min(0.9, guaranteedPct / 100); // safety cap at 90%
+        const maxByBankroll = Math.floor((clobBalance * bankrollFrac) / totalCost);
+        const shares = Math.min(maxByLiquidity, maxByBankroll);
+        
+        if (shares < 5) {
+          arbRejectStats.minShares++;
+          console.log(`   SKIP: Only ${shares} shares affordable (need 5 min)`);
+          continue;
+        }
+        
+        // Execute both sides
+        try {
+          // Buy side A
+          const resultA = await executor.buyFOK(tokenA, shares, askA);
+          if (!resultA || resultA.status === 'FAILED' || resultA.status === 'EXPIRED') {
+            console.log(`   ❌ Side A failed: ${resultA?.status}`);
+            continue;
+          }
+          console.log(`   ✅ Side A: ${nameA} ${shares} shares @ $${resultA.price}`);
+          
+          // Small delay to avoid rate limit
+          await new Promise(r => setTimeout(r, 2000));
+          
+          // Buy side B
+          const resultB = await executor.buyFOK(tokenB, shares, askB);
+          if (!resultB || resultB.status === 'FAILED' || resultB.status === 'EXPIRED') {
+            console.log(`   ⚠️ Side B failed — Side A is now an unhedged position`);
+            // Register Side A as a regular position for the old arb scanner to try later
+            registerPosition(tokenA, nameA, label, resultA.price, tokenB, market.conditionId);
+            continue;
+          }
+          console.log(`   ✅ Side B: ${nameB} ${shares} shares @ $${resultB.price}`);
+          
+          const actualTotal = resultA.price + resultB.price;
+          const actualProfit = ((1 - actualTotal) * 100).toFixed(1);
+          
+          arbScannedGames.add(label);
+          
+          // Log both sides
+          const orderA = {
+            timestamp: new Date().toISOString(), team: nameA, game: label,
+            sport: 'arb', strategy: 'arb-proactive', side: 'BUY', price: resultA.price, size: shares,
+            cost: (resultA.price * shares).toFixed(2), edge: actualProfit,
+            tokenId: tokenA, status: resultA.status, orderId: resultA.orderId,
+          };
+          const orderB = {
+            timestamp: new Date().toISOString(), team: nameB, game: label,
+            sport: 'arb', strategy: 'arb-proactive', side: 'BUY', price: resultB.price, size: shares,
+            cost: (resultB.price * shares).toFixed(2), edge: actualProfit,
+            tokenId: tokenB, status: resultB.status, orderId: resultB.orderId,
+          };
+          fs.appendFileSync('executed-orders.jsonl', JSON.stringify(orderA) + '\n');
+          fs.appendFileSync('executed-orders.jsonl', JSON.stringify(orderB) + '\n');
+          
+          sendAlert('arb', `🔒 ARB LOCKED: ${label}\n${nameA} ${shares}sh @ $${resultA.price} + ${nameB} ${shares}sh @ $${resultB.price} = $${actualTotal.toFixed(3)}/share\nGuaranteed ${actualProfit}% profit ($${((1-actualTotal)*shares).toFixed(2)} total)`);
+          
+          // Update CLOB balance
+          clobBalance -= (resultA.price * shares) + (resultB.price * shares);
+          
+        } catch (err) {
+          console.error(`   ❌ Arb execution error: ${err.message}`);
+        }
+      } catch {}
+    }
+    
+    // Rate limit between games
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+async function scanArbLocks(executor) {
+  for (const [tokenId, pos] of openPositions) {
+    if (pos.hedged || !pos.otherTokenId) continue;
+    
+    try {
+      // Get other side's current best ask
+      const r = await fetch(`https://clob.polymarket.com/book?token_id=${pos.otherTokenId}`);
+      const book = await r.json();
+      const asks = (book.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+      const otherAsk = asks[0] ? parseFloat(asks[0].price) : null;
+      
+      if (!otherAsk) continue;
+      
+      // === ARB PROTECTION FIXES ===
+      const totalCost = pos.entryPrice + otherAsk;
+      
+      // 1. Must be below threshold
+      if (totalCost >= ARB_THRESHOLD) continue;
+      
+      // 2. Verify combined cost is actually profitable BEFORE executing
+      // The real check: entry + hedge must be < 0.97 (the ARB_THRESHOLD)
+      // No flat cap — just verify the math works
+      if (pos.entryPrice + otherAsk >= ARB_THRESHOLD) {
+        console.log(`[ARB SKIP] ${pos.game} — combined $${(pos.entryPrice + otherAsk).toFixed(3)} >= $${ARB_THRESHOLD} (not profitable)`);
+        continue;
+      }
+      
+      // 3. Must have size available at that price (check for liquidity)
+      const askSize = asks[0] ? parseFloat(asks[0].size) : 0;
+      if (askSize < 1) {
+        console.log(`[ARB SKIP] ${pos.game} — no liquidity at ask price (size: ${askSize})`);
+        continue;
+      }
+      
+      // Arb floor: $0.05 (lower than edge $0.15 — arbs are guaranteed)
+      if (otherAsk < 0.05) continue;
+      
+      const guaranteedProfit = ((1 - totalCost) * 100).toFixed(1);
+      console.log(`\n🔒 ARB LOCK: ${pos.game}`);
+      console.log(`   Side A (held): ${pos.team} @ $${pos.entryPrice}`);
+      console.log(`   Side B (hedge): ask $${otherAsk} (size: ${askSize})`);
+      console.log(`   Total: $${totalCost.toFixed(3)} → Guaranteed ${guaranteedProfit}% profit`);
+      
+      // 4. Partial hedge first to preserve upside while reducing risk
+      // One-shot attempt cooldown to prevent churn/spam
+      const now = Date.now();
+      if (now - (pos.lastHedgeAttempt || 0) < 180000) continue; // 3 min cooldown
+      pos.lastHedgeAttempt = now;
+
+      const fullShares = pos.shares || 5;
+      const hedgeShares = Math.max(5, Math.floor(fullShares * 0.5)); // hedge 50% first
+      const hedgeCost = otherAsk * hedgeShares;
+
+      // Skip tiny hedges (usually min-size / bad fills)
+      if (hedgeCost < 2) {
+        console.log(`   [ARB SKIP] Hedge notional too small ($${hedgeCost.toFixed(2)} < $2.00)`);
+        continue;
+      }
+      
+      if (hedgeCost > clobBalance * 0.25) {
+        console.log(`   [ARB SKIP] Hedge cost $${hedgeCost.toFixed(2)} exceeds 25% of bankroll`);
+        continue;
+      }
+      
+      try {
+        const result = await executor.buyFOK(pos.otherTokenId, hedgeShares, otherAsk);
+        if (result && result.status !== 'FAILED' && result.status !== 'EXPIRED') {
+          const filledSize = result.size || hedgeShares;
+          const actualTotal = pos.entryPrice + result.price;
+          
+          if (actualTotal >= ARB_THRESHOLD) {
+            console.log(`   ⚠️ ARB ABORTED — actual total $${actualTotal.toFixed(3)} >= threshold`);
+            continue;
+          }
+          
+          if (filledSize < hedgeShares * 0.9) {
+            console.log(`   ⚠️ PARTIAL FILL: only ${filledSize}/${hedgeShares} shares filled`);
+            sendAlert('trade', `⚠️ PARTIAL HEDGE FILL: ${pos.game} | ${filledSize}/${hedgeShares} shares`);
+          }
+
+          // Mark as hedged-once to avoid repeated churn; this is deliberate partial derisk
+          pos.hedged = true;
+          pos.hedgedShares = (pos.hedgedShares || 0) + filledSize;
+          const profit = ((1 - actualTotal) * filledSize).toFixed(2);
+          console.log(`   ✅ HEDGED: BUY ${filledSize} @ $${result.price} = $${(result.price * filledSize).toFixed(2)}`);
+          sendAlert('arb', `🛡️ PARTIAL HEDGE: ${pos.game} | Hedged ${filledSize}/${fullShares} shares | Entry $${pos.entryPrice} + Hedge $${result.price} = $${actualTotal.toFixed(3)} | Locked $${profit} (${guaranteedProfit}% on hedged slice)`);
+          
+          // Log hedge to executed-orders
+          const hedgeOrder = {
+            timestamp: new Date().toISOString(), team: 'HEDGE-' + pos.team, game: pos.game,
+            sport: 'arb-hedge', strategy: 'arb-reactive', side: 'BUY', price: result.price, size: filledSize,
+            cost: (result.price * filledSize).toFixed(2), edge: guaranteedProfit,
+            tokenId: pos.otherTokenId, status: result.status, orderId: result.orderId,
+          };
+          fs.appendFileSync('executed-orders.jsonl', JSON.stringify(hedgeOrder) + '\n');
+        } else {
+          console.log(`   ❌ Hedge FOK failed: ${result?.status || 'unknown'}`);
+        }
+      } catch (err) {
+        console.error(`   ❌ Hedge failed: ${err.message}`);
+      }
+    } catch {}
+  }
+}
+
+// === FEATURE 3: AUTO-REDEMPTION ===
+// Automatically redeems winning positions on-chain after market resolution
+async function autoRedeem() {
+  try {
+    const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+    const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+    const CTF = new ethers.Contract(CTF_CONTRACT, [
+      'function balanceOf(address,uint256) view returns (uint256)',
+      'function redeemPositions(address,bytes32,bytes32,uint256[]) external',
+    ], signer);
+    const NegRisk = new ethers.Contract('0xC5d563A36AE78145C45a50134d48A1215220f80a', [
+      'function redeemPositions(bytes32,uint256[],uint256) external',
+    ], signer);
+
+    // Load all traded token IDs
+    const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+    const tokenMap = new Map();
+    for (const line of lines) {
+      try {
+        const o = JSON.parse(line);
+        if (o.tokenId && o.tokenId.length > 20) {
+          if (!tokenMap.has(o.tokenId)) tokenMap.set(o.tokenId, { team: o.team, game: o.game });
+        }
+      } catch {}
+    }
+
+    let redeemed = 0;
+    for (const [tokenId, data] of tokenMap) {
+      const balance = await CTF.balanceOf(WALLET, tokenId);
+      const shares = parseFloat(ethers.utils.formatUnits(balance, 6));
+      if (shares < 0.01) continue;
+
+      // Check if market is resolved on-chain — don't trust gamma closed flag
+      try {
+        const resp = await fetch('https://gamma-api.polymarket.com/markets?clob_token_ids=' + tokenId);
+        const gData = await resp.json();
+        const conditionId = gData[0]?.conditionId;
+        if (!conditionId) continue;
+
+        // Check on-chain oracle first — this is the truth
+        const conditionKey = '0x' + conditionId.replace('0x', '');
+        const CTFRead = new ethers.Contract(CTF_CONTRACT, [
+          'function payoutDenominator(bytes32) view returns (uint256)',
+          'function payoutNumerators(bytes32,uint256) view returns (uint256)',
+          'function redeemPositions(address,bytes32,bytes32,uint256[]) external',
+        ], signer);
+        
+        const denominator = await CTFRead.payoutDenominator(conditionKey);
+        if (denominator.eq(0)) continue; // Oracle hasn't reported yet
+
+        console.log(`\n💰 AUTO-REDEEM: ${data.team} | ${shares.toFixed(1)} shares | conditionId: ${conditionId.substring(0, 12)}...`);
+
+        // Dynamic gas pricing — fetch current base fee
+        const feeData = await signer.provider.getFeeData();
+        const baseFee = feeData.lastBaseFeePerGas || ethers.utils.parseUnits('500', 'gwei');
+        const baseFeeGwei = parseFloat(ethers.utils.formatUnits(baseFee, 'gwei'));
+
+        // Skip if gas is too high (>150 gwei base fee)
+        if (baseFeeGwei > 150) {
+          console.log(`   ⛽ Gas too high: ${baseFeeGwei.toFixed(0)} gwei — waiting for <150 gwei`);
+          const lastGasAlert = global.lastGasAlert || 0;
+          if (Date.now() - lastGasAlert > 30 * 60 * 1000) {
+            sendAlert('warning', `⛽ HIGH GAS: Redemption pending — gas at ${baseFeeGwei.toFixed(0)} gwei (need <150)`);
+            global.lastGasAlert = Date.now();
+          }
+          continue;
+        }
+
+        const maxFee = baseFee.mul(3); // 3x base fee for buffer
+        const gasOpts = {
+          maxFeePerGas: maxFee,
+          maxPriorityFeePerGas: ethers.utils.parseUnits('50', 'gwei'),
+          gasLimit: 300000,
+        };
+
+        // Determine winning outcome from on-chain payout
+        console.log(`   Oracle denominator: ${denominator.toString()} (>0 = reported)`);
+        const num0 = await CTFRead.payoutNumerators(conditionKey, 0);
+        const num1 = await CTFRead.payoutNumerators(conditionKey, 1);
+        const winningOutcome = num1.gt(num0) ? 1 : 0;
+        const indexSet = winningOutcome === 0 ? 1 : 2;
+        console.log(`   Winning outcome: ${winningOutcome} | indexSet: ${indexSet}`);
+
+        const tx = await CTFRead.redeemPositions(
+          '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+          ethers.constants.HashZero,
+          conditionKey,
+          [indexSet],
+          gasOpts,
+        );
+        const receipt = await tx.wait();
+        console.log(`   ✅ Redeemed! TX: ${receipt.transactionHash}`);
+        sendAlert('redeem', `💰 AUTO-REDEEMED: ${data.team} | ${shares.toFixed(1)} shares → $${shares.toFixed(2)} USDC | TX: ${receipt.transactionHash.substring(0, 16)}...`);
+        redeemed++;
+      } catch (err) {
+        const shortErr = (err.message || String(err)).split('(')[0].trim();
+        console.error(`   ❌ Redeem path failed: ${shortErr}`);
+        sendAlert('error', `❌ AUTO-REDEEM ERROR: ${data.team} | ${shortErr.substring(0, 120)}`);
+      }
+
+      await new Promise(r => setTimeout(r, 2000)); // Rate limit between checks
+    }
+
+    if (redeemed > 0) {
+      console.log(`\n💰 Auto-redeemed ${redeemed} positions`);
+      // Update CLOB balance
+      try {
+        const { ClobClient } = require('@polymarket/clob-client');
+        const creds = JSON.parse(fs.readFileSync('.api-creds.json', 'utf-8'));
+        const client = new ClobClient('https://clob.polymarket.com', 137, signer, creds, 0, signer.address);
+        const bal = await client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+        clobBalance = parseInt(bal.balance) / 1e6;
+        console.log(`   Updated CLOB balance: $${clobBalance.toFixed(2)}`);
+      } catch {}
+    }
+    return redeemed;
+  } catch (err) {
+    console.error('[Auto-Redeem] Error:', err.message);
+    return 0;
+  }
+}
+
+// === FEATURE 7: EDGE HISTOGRAM LOGGING ===
+// Logs ALL edges seen (not just traded) to track market efficiency over time
+// Deduplicates: max 1 log per team per 60 seconds
+const edgeHistogramFile = 'edge-histogram.jsonl';
+const _lastEdgeLog = new Map(); // "team:game" -> timestamp
+function logEdgeSeen(team, game, sport, edge, polyAsk, pinnacleImplied, traded, rejectReason = null, rejectContext = null) {
+  const key = `${team}:${game}`;
+  const now = Date.now();
+  const last = _lastEdgeLog.get(key) || 0;
+  if (now - last < 60000 && !traded && !rejectReason) return; // Dedupe generic edges only; always log rejects/executions
+  _lastEdgeLog.set(key, now);
+  
+  // === EDGE HISTOGRAM ROTATION ===
+  // Rotate file when > 50MB to prevent unbounded growth
+  try {
+    const stats = fs.statSync(edgeHistogramFile);
+    if (stats.size > 50 * 1024 * 1024) {
+      const backup = edgeHistogramFile.replace('.jsonl', `-${Date.now()}.jsonl`);
+      fs.renameSync(edgeHistogramFile, backup);
+      console.log(`[Edge Log] Rotated: ${backup}`);
+    }
+  } catch {}
+  
+  const nowT = new Date();
+  const estHour = Number(nowT.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }));
+  const entry = {
+    time: nowT.toISOString(),
+    timeEST: nowT.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true }),
+    hour: estHour,
+    team, game, sport,
+    edge: parseFloat(edge.toFixed(2)),
+    polyAsk, pinnacleImplied,
+    traded,
+    rejectReason,
+    rejectContext,
+  };
+  fs.appendFileSync(edgeHistogramFile, JSON.stringify(entry) + '\n');
+}
+
+// === FEATURE 8: POSITION AGING ALERTS ===
+// Flags positions held > 4 hours without resolution
+function checkPositionAging() {
+  const now = Date.now();
+  for (const [tokenId, pos] of openPositions) {
+    if (pos.hedged) continue; // Arb-locked positions are fine to hold
+    const age = now - (pos.entryTime || now);
+    if (age > 4 * 3600000 && !pos.agingAlerted) {
+      console.log(`⏰ AGING: ${pos.team} held for ${(age/3600000).toFixed(1)}h without resolution`);
+      sendAlert('audit', `⏰ Position aging: ${pos.team} | Held ${(age/3600000).toFixed(1)}h | Consider manual exit`);
+      pos.agingAlerted = true;
+    }
+  }
+}
+
+// === FEATURE 10: WEBSOCKET RECONNECTION METRICS ===
+const wsMetrics = {
+  polyDisconnects: 0,
+  polyReconnectMs: [],
+  pdDisconnects: 0,
+  pdReconnectMs: [],
+  lastDisconnect: null,
+};
+
+function logWsMetrics() {
+  const avgPolyReconnect = wsMetrics.polyReconnectMs.length
+    ? (wsMetrics.polyReconnectMs.reduce((a,b)=>a+b,0) / wsMetrics.polyReconnectMs.length / 1000).toFixed(1)
+    : 'N/A';
+  const avgPdReconnect = wsMetrics.pdReconnectMs.length
+    ? (wsMetrics.pdReconnectMs.reduce((a,b)=>a+b,0) / wsMetrics.pdReconnectMs.length / 1000).toFixed(1)
+    : 'N/A';
+  console.log(`[WS Metrics] Poly: ${wsMetrics.polyDisconnects} disconnects (avg ${avgPolyReconnect}s reconnect) | PD: ${wsMetrics.pdDisconnects} disconnects (avg ${avgPdReconnect}s reconnect)`);
+  fs.appendFileSync('ws-metrics.jsonl', JSON.stringify({ ...wsMetrics, time: new Date().toISOString() }) + '\n');
+}
+
+// === FEATURE 11: GAS BALANCE ALERT ===
+async function checkGasBalance() {
+  try {
+    const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+    const polBal = parseFloat(ethers.utils.formatEther(await provider.getBalance(WALLET)));
+    if (polBal < 0.5) {
+      console.log(`⛽ LOW GAS: ${polBal.toFixed(3)} POL remaining (< 0.5 threshold)`);
+      sendAlert('audit', `⛽ LOW GAS ALERT: Only ${polBal.toFixed(3)} POL remaining! Need top-up to continue trading.`);
+    }
+    return polBal;
+  } catch (err) {
+    console.error('[Gas Check] Error:', err.message);
+    return null;
+  }
+}
+
+// === LOG ROTATION ===
+// Rotate trader.log if > 500KB to prevent unbounded growth
+try {
+  const logPath = path.join(__dirname, 'trader.log');
+  if (fs.existsSync(logPath)) {
+    const stats = fs.statSync(logPath);
+    if (stats.size > 500 * 1024) {
+      const backupPath = logPath + '.1';
+      if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
+      fs.renameSync(logPath, backupPath);
+      fs.writeFileSync(logPath, `[${new Date().toISOString()}] Log rotated (prev: ${(stats.size/1024).toFixed(0)}KB)\n`);
+      console.log(`[Log] Rotated trader.log (${(stats.size/1024).toFixed(0)}KB → backup)`);
+    }
+  }
+} catch (e) { /* ignore rotation errors */ }
+
+async function main() {
+  const sports = ['ncaab', 'nba'];
+  const apiKey = process.env.PREDICTIONDATA_API_KEY || C.API_KEYS.predictionData;
+
+  console.log('='.repeat(64));
+  console.log('  🔴 LIVE FOK TRADER v3');
+  console.log('  Kelly sizing | Arb scanner | Auto-redeem | Sell detection');
+  console.log('  Strategy: Edge (10% Kelly) + Arb (25% bankroll/$25) + Sell signals');
+  console.log('  Fav range: 65-85% | 2%+ edge | $0.85 max | 72h resolution');
+  console.log('='.repeat(64));
+
+  // Load persisted positions
+  loadPositions();
+  loadPeakBalance();
+
+  // === CIRCUIT BREAKER CHECK ===
+  const { drawdown, drawdownPercent, currentBalance, peakBalance: peak } = await checkCircuitBreaker();
+  if (drawdown >= C.CIRCUIT_BREAKER.drawdownPercent) {
+    console.log(`\n🚨 CIRCUIT BREAKER: Drawdown is ${drawdownPercent.toFixed(1)}% (threshold: 50%). Trading HALTED.`);
+    console.log(`   Peak: $${peak.toFixed(2)} | Current: $${currentBalance.toFixed(2)} | Down: $${(peak - currentBalance).toFixed(2)}`);
+    sendAlert('error', `🚨 CIRCUIT BREAKER: Trading halted. Drawdown: ${drawdownPercent.toFixed(1)}% (50% threshold)`);
+    process.exit(1);
+  }
+  console.log(`[Circuit Breaker] ACTIVE - Drawdown: ${drawdownPercent.toFixed(1)}% (threshold: 50%)`);
+
+  // === AUTO-DEPOSIT ===
+  await autoDeposit();
+
+  // Init executor
+  const executor = new Executor({
+    betSize: 1.50, // Will be overridden by Kelly per trade
+    maxExposure: 30,
+    maxOpenOrders: 10,
+    dryRun: process.argv.includes('--dry'),
+  });
+  await executor.init();
+
+  // Get initial CLOB balance for Kelly
+  try {
+    const { ClobClient } = require('@polymarket/clob-client');
+    const { Wallet } = require('ethers');
+    const signer = new Wallet(process.env.PRIVATE_KEY);
+    const creds = JSON.parse(fs.readFileSync('.api-creds.json', 'utf-8'));
+    const client = new ClobClient('https://clob.polymarket.com', 137, signer, creds, 0, signer.address);
+    const bal = await client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+    clobBalance = parseInt(bal.balance) / 1e6;
+    console.log(`  [Kelly] CLOB balance: $${clobBalance.toFixed(2)}`);
+  } catch (err) {
+    console.log(`  [Kelly] Failed to get CLOB balance, using default $${clobBalance}`);
+  }
+
+  // Initial on-chain check
+  lastChainData = await checkOnChainPositions();
+  if (lastChainData) {
+    console.log(`  [Positions] ${lastChainData.positions.length} on-chain | Wallet: $${lastChainData.walletUSDC.toFixed(2)} USDC.e | ${lastChainData.pol.toFixed(3)} POL`);
+  }
+
+  // Resolve ALL matched games (no index cap)
+  const allGames = [];
+  const seen = new Set();
+  for (const sport of sports) {
+    try {
+      const resolved = await resolveAllGames(sport);
+      for (const game of resolved) {
+        const label = `${game.teams.away} @ ${game.teams.home}`;
+        if (seen.has(label)) continue;
+        seen.add(label);
+        allGames.push({ ...game, sport });
+      }
+    } catch (err) {
+      console.error(`  ${sport.toUpperCase()} resolveAllGames error: ${err.message}`);
+    }
+
+    const sportGames = allGames.filter(g => g.sport === sport);
+    console.log(`\n  ${sport.toUpperCase()}: ${sportGames.length} games`);
+    for (const g of sportGames.slice(0, 15)) {
+      const status = g.predictionData.fixture?.status === 'inprogress' ? ' [LIVE]' : '';
+      console.log(`    • ${g.teams.away} @ ${g.teams.home}${status}`);
+    }
+    if (sportGames.length > 15) {
+      console.log(`    ... and ${sportGames.length - 15} more`);
+    }
+  }
+
+  // Force-follow Michigan Wolverines games even if cross-source match misses
+  try {
+    const series = await fetch('https://gamma-api.polymarket.com/series/10470').then(r => r.json());
+    const events = series.events || [];
+    for (const ev of events) {
+      const title = (ev.title || '').toLowerCase();
+      const slug = (ev.slug || '').toLowerCase();
+      const isMichiganWolverines = /michigan wolverines/.test(title)
+        || (/michigan/.test(title) && /wolverines/.test(title))
+        || /-michigan-/.test(slug);
+      if (!isMichiganWolverines) continue;
+      try {
+        const forced = await resolveBySlug(ev.slug);
+        const label = `${forced.teams.away} @ ${forced.teams.home}`;
+        if (seen.has(label)) continue;
+        seen.add(label);
+        allGames.push({ ...forced, sport: 'ncaab' });
+        console.log(`  [Watchlist] Added forced game: ${label}`);
+      } catch (err) {
+        console.log(`  [Watchlist] Failed ${ev.slug}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.log(`  [Watchlist] Error: ${err.message}`);
+  }
+
+  if (allGames.length === 0) { console.log('\nNo games found. Exiting.'); process.exit(1); }
+  console.log(`\n  Total: ${allGames.length} games\n`);
+
+  // Create traders + connect streams
+  const traders = [];
+  const pdClients = new Map();
+
+  for (const game of allGames) {
+    const trader = new Trader(game, STRATEGY, executor);
+
+    for (const market of game.polymarket.markets) {
+      for (const outcome of market.outcomes) {
+        if (outcome.tokenId) {
+          trader.onPolyUpdate({
+            tokenId: outcome.tokenId, name: outcome.name,
+            midpoint: parseFloat(outcome.price) || null,
+            bestAsk: null, bestBid: null,
+            lastTrade: parseFloat(outcome.price) || null,
+          });
+        }
+      }
+    }
+
+    const polyWS = new PolymarketWS(game.polymarket.tokens);
+    polyWS.on('price', (update) => trader.onPolyUpdate(update));
+    // Feature 10: Track WS reconnections
+    let polyDisconnectTime = null;
+    const origConnect = polyWS.connect.bind(polyWS);
+    const origWs = polyWS;
+    origWs.on('close', () => { wsMetrics.polyDisconnects++; polyDisconnectTime = Date.now(); });
+    origWs.on('open', () => { if (polyDisconnectTime) { wsMetrics.polyReconnectMs.push(Date.now() - polyDisconnectTime); polyDisconnectTime = null; } });
+    polyWS.connect();
+
+    if (game.predictionData.fixtureId) {
+      if (!pdClients.has('shared')) pdClients.set('shared', new SharedPDClient(apiKey));
+      const pdClient = pdClients.get('shared');
+      const sideNameMap = { Home: game.teams.home, Away: game.teams.away };
+      const fixtureEmitter = pdClient.watch(game.predictionData.fixtureId, sideNameMap);
+      fixtureEmitter.on('price', (update) => trader.onBookUpdate(update));
+    }
+
+    traders.push({ game, trader, polyWS });
+  }
+
+  for (const [, client] of pdClients) client.connect();
+
+  // === PERIODIC TASKS ===
+  
+  // Audit: Verify recorded trades vs on-chain positions every 5 min
+  setInterval(async () => {
+    const audit = await auditPositions();
+    saveDashboard(executor, lastChainData, audit);
+  }, 300000);
+  
+  // Status + dashboard every 2 min
+  setInterval(() => {
+    const status = executor.getStatus();
+    const now = new Date().toLocaleTimeString();
+    console.log(`\n--- ${now} | ${status.mode} | ${status.orders} orders | $${status.totalExposure}/$${status.maxExposure} ---`);
+    saveDashboard(executor, lastChainData);
+  }, 120000);
+
+  // On-chain position check every 10 min
+  setInterval(async () => {
+    lastChainData = await checkOnChainPositions();
+    
+    // Log current gas price
+    try {
+      const { ethers } = require('ethers');
+      const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+      const feeData = await provider.getFeeData();
+      const baseFee = parseFloat(ethers.utils.formatUnits(feeData.lastBaseFeePerGas || 0, 'gwei'));
+      console.log(`⛽ Gas price: ${baseFee.toFixed(0)} gwei base fee`);
+      
+      // Alert when gas drops below 100 (good for redemptions)
+      if (baseFee < 100) {
+        console.log(`   ✅ Gas is low! Good time for redemptions`);
+      }
+    } catch {}
+    
+    if (lastChainData && lastChainData.positions.length > 0) {
+      console.log(`[Positions] ${lastChainData.positions.length} active positions on-chain`);
+      for (const p of lastChainData.positions) {
+        console.log(`  ${p.shares.toFixed(2)} shares | bid $${p.currentBid || '?'} | value $${p.value ? p.value.toFixed(2) : '?'}`);
+      }
+    }
+    
+    // Update CLOB balance for Kelly
+    try {
+      const { ClobClient } = require('@polymarket/clob-client');
+      const { Wallet } = require('ethers');
+      const signer = new Wallet(process.env.PRIVATE_KEY);
+      const creds = JSON.parse(fs.readFileSync('.api-creds.json', 'utf-8'));
+      const client = new ClobClient('https://clob.polymarket.com', 137, signer, creds, 0, signer.address);
+      const bal = await client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+      clobBalance = parseInt(bal.balance) / 1e6;
+    } catch {}
+    
+    saveDashboard(executor, lastChainData);
+  }, 600000);
+
+  // Edge decay check every 2 min
+  setInterval(checkEdgeDecay, 120000);
+
+  // Arb lock scanner every 15 seconds (hedges existing positions — MUST match proactive scanner speed)
+  setInterval(() => scanArbLocks(executor), 15000);
+
+  // PROACTIVE arb scanner every 15 seconds (finds new arbs across ALL games)
+  setInterval(() => scanProactiveArbs(traders, executor), 15000);
+
+  // Arb reject summary every 60s (why no arbs fired)
+  setInterval(() => {
+    const s = arbRejectStats;
+    console.log(`[ARB SUMMARY] runs=${s.runs} found=${s.found} | thresholdMiss=${s.thresholdMiss} lowArbPct=${s.lowArbPct} lowLiquidity=${s.lowLiquidity} missingAsks=${s.missingAsks} over72h=${s.over72h} minShares=${s.minShares} priceFloor=${s.priceFloor}`);
+    // reset rolling counters
+    arbRejectStats = { runs: 0, missingAsks: 0, lowLiquidity: 0, priceFloor: 0, thresholdMiss: 0, lowArbPct: 0, over72h: 0, minShares: 0, found: 0 };
+  }, 60000);
+
+  // Game results every 10 min
+  setInterval(async () => {
+    const finished = await gameTracker.checkAllPending();
+    if (finished.length > 0) {
+      console.log(`[Tracker] ${finished.length} games finished`);
+      for (const g of finished) {
+        sendAlert('settle', `${g.won ? '✅ WIN' : '❌ LOSS'}: ${g.team} | ${g.game}`);
+        // TODO: Auto-redeem winning positions on-chain
+        // Need: 1) Get conditionId from gamma API, 2) Call CTF.redeemPositions()
+        // Currently manual — Morgan runs redemption when asked
+        
+        // Update trade-scenarios.jsonl with result
+        try {
+          const scenarioFile = 'trade-scenarios.jsonl';
+          if (fs.existsSync(scenarioFile)) {
+            const lines = fs.readFileSync(scenarioFile, 'utf-8').trim().split('\n');
+            const updated = lines.map(line => {
+              try {
+                const s = JSON.parse(line);
+                if (s.team === g.team && s.game === g.game && !s.result) {
+                  s.result = g.won ? 'win' : 'loss';
+                  s.exitPrice = g.won ? 1.00 : 0;
+                  s.pnl = g.won ? parseFloat((1.00 * s.shares - s.cost).toFixed(2)) : parseFloat((-s.cost).toFixed(2));
+                  s.settledAt = new Date().toISOString();
+                  return JSON.stringify(s);
+                }
+              } catch {}
+              return line;
+            });
+            fs.writeFileSync(scenarioFile, updated.join('\n') + '\n');
+          }
+        } catch (err) {
+          console.error('[Scenario] Failed to update result:', err.message);
+        }
+      }
+      gameTracker.save();
+    }
+  }, 600000);
+
+  // Feature 3: Auto-redemption every 5 min
+  setInterval(autoRedeem, 300000);
+
+  // Feature 8: Position aging check every 30 min
+  setInterval(checkPositionAging, 1800000);
+
+  // Feature 10: WS metrics logging every 30 min
+  setInterval(logWsMetrics, 1800000);
+
+  // Feature 11: Gas balance check every 30 min
+  setInterval(checkGasBalance, 1800000);
+
+  // Initial auto-redeem on startup (catch anything sitting unredeemed)
+  setTimeout(autoRedeem, 30000); // 30s after start
+
+  // Initial gas check
+  setTimeout(checkGasBalance, 10000);
+
+  // Initial dashboard + audit save
+  const startupAudit = await auditPositions();
+  saveDashboard(executor, lastChainData, startupAudit);
+  console.log('\n✅ Startup audit complete — recording all positions');
+
+  process.on('SIGINT', () => {
+    console.log('\n\nShutting down...');
+    traders.forEach(t => t.polyWS.close());
+    for (const [, c] of pdClients) c.close();
+    const status = executor.getStatus();
+    console.log(`Final: ${status.orders} orders, $${status.totalExposure} exposure`);
+    saveDashboard(executor, lastChainData);
+    process.exit(0);
+  });
+}
+
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });
+#!/usr/bin/env node
+/**
+ * Notification sender — reads notifications.jsonl and outputs unsent ones
+ * Called by cron or heartbeat to forward trade alerts to Telegram
+ * 
+ * Dedup: tracks sent TX hashes in .notify-sent to prevent re-reporting
+ * Lock: uses .notify.lock to prevent concurrent reads
+ */
+const fs = require('fs');
+const path = require('path');
+
+const NOTIFY_FILE = path.join(__dirname, 'notifications.jsonl');
+const SENT_FILE = path.join(__dirname, '.notify-sent');
+const LOCK_FILE = path.join(__dirname, '.notify.lock');
+
+// Simple file lock — bail if another instance is running
+try {
+  const fd = fs.openSync(LOCK_FILE, 'wx');
+  fs.writeFileSync(fd, String(process.pid));
+  fs.closeSync(fd);
+} catch {
+  // Lock exists — check if stale (>60s)
+  try {
+    const stat = fs.statSync(LOCK_FILE);
+    if (Date.now() - stat.mtimeMs > 60000) {
+      fs.unlinkSync(LOCK_FILE);
+      const fd = fs.openSync(LOCK_FILE, 'wx');
+      fs.writeFileSync(fd, String(process.pid));
+      fs.closeSync(fd);
+    } else {
+      process.exit(0); // another instance running, skip
+    }
+  } catch { process.exit(0); }
+}
+
+// Cleanup lock on exit
+const cleanup = () => { try { fs.unlinkSync(LOCK_FILE); } catch {} };
+process.on('exit', cleanup);
+process.on('SIGINT', () => { cleanup(); process.exit(0); });
+process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+
+if (!fs.existsSync(NOTIFY_FILE)) {
+  cleanup();
+  process.exit(0);
+}
+
+// Load previously sent TX hashes/message hashes for dedup
+const sentSet = new Set();
+if (fs.existsSync(SENT_FILE)) {
+  const sentLines = fs.readFileSync(SENT_FILE, 'utf-8').trim().split('\n').filter(Boolean);
+  for (const l of sentLines) sentSet.add(l);
+}
+
+// Extract a dedup key from a notification (TX hash or message hash)
+function dedupKey(n) {
+  // Try to extract TX hash from message
+  const txMatch = n.message && n.message.match(/TX:\s*(0x[a-f0-9]+)/i);
+  if (txMatch) return txMatch[1];
+  // Fallback: hash of message + time
+  const crypto = require('crypto');
+  return crypto.createHash('md5').update((n.message || '') + (n.time || '')).digest('hex');
+}
+
+const lines = fs.readFileSync(NOTIFY_FILE, 'utf-8').trim().split('\n').filter(Boolean);
+const unsent = [];
+const updated = [];
+const newSentKeys = [];
+
+for (const line of lines) {
+  try {
+    const n = JSON.parse(line);
+    if (!n.sent) {
+      const key = dedupKey(n);
+      const ageMs = Date.now() - (n.time ? new Date(n.time).getTime() : 0);
+      if (ageMs <= 10 * 60 * 1000 && !sentSet.has(key)) {
+        unsent.push(n);
+        newSentKeys.push(key);
+      }
+      n.sent = true;
+      sentSet.add(key);
+    }
+    updated.push(JSON.stringify(n));
+  } catch {
+    updated.push(line);
+  }
+}
+
+// Always write back to mark sent flags (even if no unsent to output)
+fs.writeFileSync(NOTIFY_FILE, updated.join('\n') + '\n');
+
+// Append new sent keys to dedup file
+if (newSentKeys.length > 0) {
+  fs.appendFileSync(SENT_FILE, newSentKeys.join('\n') + '\n');
+}
+
+// Trim dedup file if too large (keep last 5000 entries)
+if (sentSet.size > 5000) {
+  const arr = [...sentSet].slice(-5000);
+  fs.writeFileSync(SENT_FILE, arr.join('\n') + '\n');
+}
+
+if (unsent.length > 0) {
+  for (const n of unsent) {
+    console.log(n.message);
+    console.log('---');
+  }
+}
+#!/usr/bin/env node
+/**
+ * On-chain verified status report. No logs, no memory, no bullshit.
+ * Queries blockchain directly for USDC, POL, and ALL CTF positions.
+ */
+const fs = require('fs');
+const { ethers } = require('ethers');
+try { require('dotenv').config(); } catch { /* load .env manually */ 
+  const envFile = require('fs').readFileSync('.env','utf8');
+  envFile.split('\n').forEach(l => { const [k,...v] = l.split('='); if(k&&v.length) process.env[k.trim()] = v.join('=').trim(); });
+}
+
+const WALLET = '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe';
+const ALCHEMY_RPC = process.env.ALCHEMY_RPC || 'https://polygon-mainnet.g.alchemy.com/v2/qDVRktAwArPbVW_c3vVhg';
+
+async function main() {
+  const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+  
+  // 1. USDC balance
+  const USDC = new ethers.Contract('0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', 
+    ['function balanceOf(address) view returns (uint256)'], provider);
+  const usdcBal = parseFloat(ethers.utils.formatUnits(await USDC.balanceOf(WALLET), 6));
+  
+  // 2. POL balance
+  const polBal = parseFloat(ethers.utils.formatEther(await provider.getBalance(WALLET)));
+  
+  // 3. ALL CTF positions — on-chain
+  const CTF = new ethers.Contract('0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
+    ['function balanceOf(address,uint256) view returns (uint256)'], provider);
+  
+  // Get every token ID we've ever traded
+  const lines = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+  const tokenMap = new Map();
+  for (const line of lines) {
+    try {
+      const o = JSON.parse(line);
+      if (o.tokenId && o.tokenId.length > 20) {
+        if (!tokenMap.has(o.tokenId)) {
+          tokenMap.set(o.tokenId, { team: o.team, game: o.game, totalCost: 0, shares: 0 });
+        }
+        tokenMap.get(o.tokenId).totalCost += parseFloat(o.cost) || 0;
+        tokenMap.get(o.tokenId).shares += o.size || 0;
+      }
+    } catch {}
+  }
+  
+  // Query chain for each
+  const positions = [];
+  let totalPositionValue = 0;
+  
+  // Step 1: Get all on-chain balances in parallel
+  const tokenEntries = [...tokenMap.entries()];
+  const balanceChecks = tokenEntries.map(([tokenId]) => 
+    CTF.balanceOf(WALLET, tokenId).then(b => ({ tokenId, balance: b })).catch(() => ({ tokenId, balance: 0 }))
+  );
+  const balances = await Promise.all(balanceChecks);
+  
+  // Step 2: Filter to ACTUAL non-zero balances (redeemed positions excluded)
+  const activeTokens = balances.filter(b => {
+    const bal = parseFloat(ethers.utils.formatUnits(b.balance, 6));
+    return bal > 0.01; // Only show positions with actual shares
+  });
+  
+  // Log how many redeemed positions were filtered
+  const redeemedCount = balances.length - activeTokens.length;
+  if (redeemedCount > 0) {
+    console.log(`  (Filtered ${redeemedCount} redeemed positions - 0 balance)`);
+  }
+  
+  if (activeTokens.length === 0) {
+    console.log('  No active positions (all redeemed or sold)');
+  }
+  
+  const positionChecks = activeTokens.map(async ({ tokenId, balance }) => {
+    const onChain = parseFloat(ethers.utils.formatUnits(balance, 6));
+    const data = tokenMap.get(tokenId);
+    
+    // Fetch book price and gamma data in parallel
+    const [bookResult, gammaResult] = await Promise.allSettled([
+      fetch('https://clob.polymarket.com/book?token_id=' + tokenId).then(r => r.json()).catch(() => null),
+      fetch('https://gamma-api.polymarket.com/markets?clob_token_ids=' + tokenId).then(r => r.json()).catch(() => null),
+    ]);
+    
+    const book = bookResult.status === 'fulfilled' ? bookResult.value : null;
+    const gData = gammaResult.status === 'fulfilled' ? gammaResult.value : null;
+    
+    let currentPrice = null;
+    if (book) {
+      const bids = (book.bids || []).sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+      currentPrice = bids[0] ? parseFloat(bids[0].price) : null;
+    }
+    
+    let status = 'ACTIVE';
+    let resolvedValue = null;
+    
+    if (!currentPrice || currentPrice < 0.01) {
+      if (gData && gData[0]?.closed) {
+        const outcomes = JSON.parse(gData[0].outcomePrices || '[]');
+        const tokenIds = JSON.parse(gData[0].clobTokenIds || '[]');
+        const idx = tokenIds.indexOf(tokenId);
+        if (idx >= 0 && outcomes[idx] && parseFloat(outcomes[idx]) > 0.99) {
+          status = 'WON (redeem!)';
+          resolvedValue = onChain;
+        } else {
+          status = 'RESOLVED (dead)';
+        }
+      } else {
+        status = 'RESOLVED (dead)';
+      }
+    } else if (currentPrice > 0.99) {
+      status = 'WON (redeem!)';
+    }
+    
+    const value = resolvedValue ? resolvedValue : (currentPrice ? onChain * currentPrice : 0);
+    
+    return {
+      team: data.team,
+      game: data.game,
+      shares: onChain,
+      avgCost: (data.totalCost / data.shares).toFixed(3),
+      currentBid: resolvedValue ? '1.000' : (currentPrice ? currentPrice.toFixed(3) : '0.000'),
+      value: value.toFixed(2),
+      pnl: (value - data.totalCost).toFixed(2),
+      status,
+      _value: value,
+    };
+  });
+  
+  const posResults = await Promise.all(positionChecks);
+  
+  // Filter to only show positions with actual value OR active status
+  // Hide resolved dead positions with $0 value
+  for (const p of posResults) {
+    totalPositionValue += p._value;
+    delete p._value;
+    
+    // Only add to display if it has value or is active
+    if (p.status === 'ACTIVE' || parseFloat(p.value) > 0.01 || p.status === 'WON (redeem!)') {
+      positions.push(p);
+    }
+  }
+  
+  // CLOB balance (API)
+  let clobBalance = null;
+  try {
+    // Read from trader log or executor
+    const logLines = fs.readFileSync('trader.log', 'utf-8').split('\n').reverse();
+    for (const l of logLines) {
+      const m = l.match(/CLOB balance: \$([0-9.]+)/);
+      if (m) { clobBalance = parseFloat(m[1]); break; }
+    }
+  } catch {}
+
+  // Output
+  console.log('══════════════════════════════════════════');
+  console.log('  ON-CHAIN VERIFIED STATUS');
+  console.log('  ' + new Date().toLocaleString('en-US', {timeZone:'America/New_York'}));
+  console.log('══════════════════════════════════════════');
+  console.log('');
+  console.log('💰 BALANCES (on-chain)');
+  console.log('  Wallet USDC:  $' + usdcBal.toFixed(2));
+  if (clobBalance !== null) console.log('  CLOB USDC:    $' + clobBalance.toFixed(2));
+  console.log('  POL (gas):    ' + polBal.toFixed(3));
+  console.log('');
+  
+  if (positions.length > 0) {
+    console.log('📊 POSITIONS (on-chain verified)');
+    positions.forEach(p => {
+      const tag = p.status !== 'ACTIVE' ? ` [${p.status}]` : '';
+      console.log('  ' + p.team + tag);
+      console.log('    ' + p.shares.toFixed(1) + ' shares | avg $' + p.avgCost + ' | bid $' + p.currentBid + ' | value $' + p.value + ' | P&L $' + p.pnl);
+    });
+    console.log('');
+    console.log('  Total position value: $' + totalPositionValue.toFixed(2));
+  } else if (redeemedCount > 0) {
+    console.log('📊 NO ACTIVE POSITIONS — All redeemed or resolved to $0');
+    console.log('  (See dashboard.json for historical positions)');
+  } else {
+    console.log('📊 NO ACTIVE POSITIONS');
+  }
+  
+  console.log('');
+  const totalValue = usdcBal + totalPositionValue;
+  console.log('📈 TOTALS');
+  console.log('  Wallet + positions: $' + totalValue.toFixed(2));
+  console.log('  Total funded:       $160.00');
+  console.log('  Net P&L:            $' + (totalValue - 160).toFixed(2));
+  
+  // Order success rate
+  if (fs.existsSync('executed-orders.jsonl')) {
+    const orders = fs.readFileSync('executed-orders.jsonl', 'utf-8').trim().split('\n');
+    let total = 0, succeeded = 0, failed = 0;
+    for (const line of orders) {
+      try {
+        const o = JSON.parse(line);
+        total++;
+        if (o.status === 'FAILED' || o.status === 400) failed++;
+        else succeeded++;
+      } catch {}
+    }
+    console.log('');
+    console.log('📋 ORDER STATS');
+    console.log('  Total orders: ' + total + ' | Success: ' + succeeded + ' | Failed: ' + failed + ' (' + (total > 0 ? (failed/total*100).toFixed(0) : 0) + '% fail rate)');
+  }
+  
+  // Edge histogram stats
+  if (fs.existsSync('edge-histogram.jsonl')) {
+    const edges = fs.readFileSync('edge-histogram.jsonl', 'utf-8').trim().split('\n').filter(Boolean).length;
+    console.log('  Edges observed: ' + edges);
+  }
+  
+  // Gas alert
+  if (polBal < 0.5) {
+    console.log('');
+    console.log('⛽ LOW GAS WARNING: ' + polBal.toFixed(3) + ' POL — need top-up!');
+  }
+  
+  // Trader process status
+  const { execSync } = require('child_process');
+  const traderProcs = execSync('ps aux | grep "live-trader" | grep -v grep | wc -l').toString().trim();
+  console.log('');
+  console.log('🤖 TRADER: ' + (parseInt(traderProcs) > 0 ? '✅ Running' : '❌ DOWN'));
+  
+  // Uptime
+  try {
+    const pid = execSync('pgrep -f "node.*live-trader"').toString().trim().split('\n')[0];
+    if (pid) {
+      const elapsed = execSync(`ps -o etime= -p ${pid}`).toString().trim();
+      console.log('  Uptime: ' + elapsed);
+    }
+  } catch {}
+}
+
+main().catch(err => console.error('Status failed:', err.message));
+{
+  "name": "live-compare",
+  "version": "1.0.0",
+  "description": "Real-time cross-market value comparison: Polymarket CLOB vs sportsbooks",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "nba": "node index.js --sport nba",
+    "ncaab": "node index.js --sport ncaab"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.2.4",
+    "dotenv": "^17.3.1",
+    "ethers": "^5.8.0",
+    "sqlite3": "^5.1.7",
+    "ws": "^8.16.0"
+  }
+}

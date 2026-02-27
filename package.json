@@ -1,0 +1,35 @@
+{
+  "name": "poly-edge-v2",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently --names api,ui --prefix-colors cyan,magenta \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "start": "NODE_ENV=production NODE_TLS_REJECT_UNAUTHORIZED=0 node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "dev:backend": "NODE_TLS_REJECT_UNAUTHORIZED=0 tsx watch src/index.ts",
+    "build:all": "npm run build && npm run build:frontend"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.3",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.8",
+    "@types/ws": "^8.5.14",
+    "concurrently": "^9.2.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
