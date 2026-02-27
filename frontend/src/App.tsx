@@ -279,6 +279,7 @@ export default function App() {
                         <th className="text-right py-2 px-3">Size</th>
                         <th className="text-right py-2 px-3">Edge</th>
                         <th className="text-right py-2 px-3">Status</th>
+                        <th className="text-right py-2 px-3">On-Chain</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -299,6 +300,12 @@ export default function App() {
                                 t.status === 'FAILED' ? 'bg-red-500/20 text-red-400' :
                                 'bg-yellow-500/20 text-yellow-400'
                               }`}>{t.status}</span>
+                            </td>
+                            <td className="py-2.5 px-3 text-right">
+                              {t.tx_hash && (
+                                <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer"
+                                  className="text-blue-400 hover:text-blue-300 text-xs underline">Verify ↗</a>
+                              )}
                             </td>
                           </tr>
                         );
@@ -326,6 +333,7 @@ export default function App() {
                         <th className="text-right py-2 px-3">Last Price</th>
                         <th className="text-right py-2 px-3">Cost</th>
                         <th className="text-right py-2 px-3">P&L</th>
+                        <th className="text-right py-2 px-3">Verify</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -345,6 +353,15 @@ export default function App() {
                             <td className="py-3 px-3 text-right font-mono">${fmt(cost)}</td>
                             <td className={`py-3 px-3 text-right font-bold font-mono ${pnlColor(upnl)}`}>
                               {upnl >= 0 ? '+' : ''}{fmtUsd(upnl)}
+                            </td>
+                            <td className="py-3 px-3 text-right">
+                              <a href={`https://polygonscan.com/token/0x4D97DCd97eC945f40cF65F87097ACe5EA0476045?a=0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe`}
+                                target="_blank" rel="noreferrer"
+                                className="text-blue-400 hover:text-blue-300 text-xs underline">CTF ↗</a>
+                              {' '}
+                              <a href={`https://polymarket.com`}
+                                target="_blank" rel="noreferrer"
+                                className="text-purple-400 hover:text-purple-300 text-xs underline">Market ↗</a>
                             </td>
                           </tr>
                         );
@@ -373,6 +390,7 @@ export default function App() {
                         <th className="text-right py-2 px-3">Size</th>
                         <th className="text-right py-2 px-3">Edge</th>
                         <th className="text-right py-2 px-3">Status</th>
+                        <th className="text-right py-2 px-3">On-Chain</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -393,6 +411,12 @@ export default function App() {
                                 t.status === 'FAILED' ? 'bg-red-500/20 text-red-400' :
                                 'bg-yellow-500/20 text-yellow-400'
                               }`}>{t.status}</span>
+                            </td>
+                            <td className="py-2 px-3 text-right">
+                              {t.tx_hash && (
+                                <a href={`https://polygonscan.com/tx/${t.tx_hash}`} target="_blank" rel="noreferrer"
+                                  className="text-blue-400 hover:text-blue-300 text-xs underline">Verify ↗</a>
+                              )}
                             </td>
                           </tr>
                         );
