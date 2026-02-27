@@ -3,7 +3,8 @@ import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, R
 import { motion, AnimatePresence } from 'framer-motion';
 
 // ─── Types ──────────────────────────────────────────────────────
-interface DashboardData { positions: any[]; trades: any[]; analytics: any; equityCurve: any[]; drawdownSeries: any[]; edgeObservations: any[]; redemptions: any[]; }
+interface OnChainData { usdc: number; pol: number; totalOnChainValue: number; equity: number; totalRedeemed: number; }
+interface DashboardData { positions: any[]; trades: any[]; analytics: any; equityCurve: any[]; drawdownSeries: any[]; edgeObservations: any[]; redemptions: any[]; onChain: OnChainData | null; }
 
 // ─── EST Formatters ─────────────────────────────────────────────
 const estOpts: Intl.DateTimeFormatOptions = { timeZone: 'America/New_York' };
@@ -111,53 +112,81 @@ function EdgeChart({ trades }: { trades: any[] }) {
 
 // ─── Equity Breakdown Modal ─────────────────────────────────────
 function EquityBreakdown({ data, onClose }: { data: DashboardData; onClose: () => void }) {
-  const a = data.analytics || {};
-  const pnl = a.pnl || { realized: 0, unrealized: 0, total: 0 };
   const positions = data.positions || [];
   const trades = data.trades || [];
   const redemptions = data.redemptions || [];
-  const totalRedeemed = redemptions.reduce((s: number, r: any) => s + (r.amount || 0), 0);
-  const totalCost = positions.reduce((s: number, p: any) => s + (p.size * p.avg_price), 0);
+  const oc = data.onChain;
+  const walletUsdc = oc?.usdc ?? 0;
+  const onChainTokenValue = oc?.totalOnChainValue ?? 0;
+  const totalRedeemed = oc?.totalRedeemed ?? 0;
+  const equity = oc?.equity ?? 0;
   const matchedTrades = trades.filter((t: any) => t.status === 'matched' || t.status === 'filled' || t.status === 'delayed');
   const failedTrades = trades.filter((t: any) => t.status === 'FAILED');
 
+  // Positions with on-chain verification
+  const verifiedPositions = positions.filter((p: any) => p.on_chain_tokens != null && p.on_chain_tokens > 0);
+  const dbOnlyPositions = positions.filter((p: any) => p.on_chain_tokens != null && p.on_chain_tokens === 0 && p.size > 0);
+
   const pieData = [
-    { name: 'Realized P&L', value: Math.abs(pnl.realized), fill: pnl.realized >= 0 ? '#10b981' : '#ef4444' },
-    { name: 'Unrealized P&L', value: Math.abs(pnl.unrealized), fill: pnl.unrealized >= 0 ? '#34d399' : '#f87171' },
-    { name: 'Open Exposure', value: totalCost, fill: '#3b82f6' },
-    { name: 'Redeemed', value: totalRedeemed, fill: '#a78bfa' },
-  ].filter(d => d.value > 0);
+    { name: 'Wallet USDC', value: walletUsdc, fill: '#10b981' },
+    { name: 'On-Chain Tokens', value: onChainTokenValue, fill: '#3b82f6' },
+  ].filter(d => d.value > 0.01);
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={onClose}>
       <motion.div initial={{ scale: 0.95 }} animate={{ scale: 1 }} exit={{ scale: 0.95 }}
-        className="bg-[#111827] border border-[#1e293b] rounded-2xl p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-        <div className="flex justify-between items-center mb-5">
-          <h2 className="text-lg font-bold">💰 Equity Breakdown</h2>
+        className="bg-[#111827] border border-[#1e293b] rounded-2xl p-6 max-w-lg w-full max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-lg font-bold">💰 On-Chain Equity Breakdown</h2>
           <button onClick={onClose} className="text-gray-500 hover:text-white text-lg">✕</button>
         </div>
+
+        <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-3 py-2 mb-4 text-[11px] text-emerald-400">
+          🔗 All values verified on-chain via Polygon RPC — not from internal DB
+        </div>
+
         {pieData.length > 0 && (
-          <div className="flex justify-center mb-5">
-            <PieChart width={200} height={200}><Pie data={pieData} cx={100} cy={100} innerRadius={50} outerRadius={80} dataKey="value" /></PieChart>
+          <div className="flex justify-center mb-4">
+            <PieChart width={180} height={180}><Pie data={pieData} cx={90} cy={90} innerRadius={45} outerRadius={70} dataKey="value" /></PieChart>
           </div>
         )}
-        <div className="space-y-3 text-sm">
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Starting Capital</span><span className="font-mono">$1,000.00</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Realized P&L</span><span className={`font-mono font-bold ${pnlColor(pnl.realized)}`}>{fmtUsd(pnl.realized)}</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Unrealized P&L</span><span className={`font-mono font-bold ${pnlColor(pnl.unrealized)}`}>{fmtUsd(pnl.unrealized)}</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Total Redeemed</span><span className="font-mono text-purple-400">${fmt(totalRedeemed)}</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Open Exposure</span><span className="font-mono text-blue-400">${fmt(totalCost)}</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Open Positions</span><span className="font-mono">{positions.length}</span></div>
+
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Wallet USDC.e</span><span className="font-mono">${fmt(walletUsdc)}</span></div>
+          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">On-Chain Token Value</span><span className="font-mono text-blue-400">${fmt(onChainTokenValue)}</span></div>
+          <div className="flex justify-between py-2 border-b border-[#1e293b] font-bold"><span>Verified Equity</span><span className="text-emerald-400">${fmt(equity)}</span></div>
+
+          <div className="pt-2 text-[10px] uppercase tracking-wider text-gray-500 font-semibold">History</div>
+          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Total Redeemed (all time)</span><span className="font-mono text-purple-400">${fmt(totalRedeemed)}</span></div>
           <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Matched Trades</span><span className="font-mono text-emerald-400">{matchedTrades.length}</span></div>
           <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Failed Trades</span><span className="font-mono text-red-400">{failedTrades.length}</span></div>
           <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Redemptions</span><span className="font-mono">{redemptions.length}</span></div>
-          <div className="flex justify-between py-2 font-bold text-base"><span>Total Equity</span><span className="text-emerald-400">${fmt(1000 + pnl.total)}</span></div>
+
+          {verifiedPositions.length > 0 && (<>
+            <div className="pt-2 text-[10px] uppercase tracking-wider text-gray-500 font-semibold">Verified Positions ({verifiedPositions.length})</div>
+            {verifiedPositions.map((p: any, i: number) => (
+              <div key={i} className="flex justify-between py-1.5 border-b border-[#1e293b]/50 text-xs">
+                <span>{p.outcome}</span>
+                <span className="font-mono text-blue-400">{fmt(p.on_chain_tokens)} tokens</span>
+              </div>
+            ))}
+          </>)}
+
+          {dbOnlyPositions.length > 0 && (<>
+            <div className="pt-2 text-[10px] uppercase tracking-wider text-yellow-500 font-semibold">⚠️ DB Only — Not Found On-Chain ({dbOnlyPositions.length})</div>
+            {dbOnlyPositions.map((p: any, i: number) => (
+              <div key={i} className="flex justify-between py-1.5 border-b border-[#1e293b]/50 text-xs text-gray-600">
+                <span>{p.outcome}</span>
+                <span className="font-mono">DB: {p.size} tokens (on-chain: 0)</span>
+              </div>
+            ))}
+          </>)}
         </div>
-        <div className="mt-4 text-center">
-          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">
-            View wallet on Polygonscan ↗
-          </a>
+
+        <div className="mt-4 flex justify-center gap-4">
+          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">Wallet ↗</a>
+          <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">CTF Tokens ↗</a>
         </div>
       </motion.div>
     </motion.div>
@@ -200,7 +229,12 @@ export default function App() {
   const positions = data.positions || [];
   const trades = data.trades || [];
   const redemptions = data.redemptions || [];
-  const equity = 1000 + pnl.total;
+  const oc = data.onChain;
+  // Real equity = on-chain USDC + on-chain token value (verified from Polygon)
+  const equity = oc ? oc.equity : 0;
+  const walletUsdc = oc?.usdc ?? 0;
+  const onChainValue = oc?.totalOnChainValue ?? 0;
+  const totalRedeemed = oc?.totalRedeemed ?? 0;
 
   const tabs = [
     { id: 'dashboard' as const, label: '📊 Dashboard' },
@@ -252,12 +286,12 @@ export default function App() {
             <motion.div key="dash" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-4 sm:space-y-6">
               {/* Portfolio Cards — clickable */}
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
-                <MetricCard label="Total Equity" value={equity} prefix="$" onClick={() => setShowBreakdown(true)} detail="Click for breakdown" />
-                <MetricCard label="Realized P&L" value={pnl.realized} prefix={pnl.realized >= 0 ? '+$' : '-$'} colorize onClick={() => setTab('trades')} detail="Click to see trades" />
-                <MetricCard label="Unrealized P&L" value={pnl.unrealized} prefix={pnl.unrealized >= 0 ? '+$' : '-$'} colorize onClick={() => setTab('positions')} detail="Click to see positions" />
-                <MetricCard label="ROI" value={a.roi * 100} suffix="%" colorize />
+                <MetricCard label="Verified Equity" value={equity} prefix="$" onClick={() => setShowBreakdown(true)} detail="🔗 On-chain verified — click for breakdown" />
+                <MetricCard label="Wallet USDC" value={walletUsdc} prefix="$" onClick={() => setShowBreakdown(true)} detail="On-chain balance" />
+                <MetricCard label="Token Value" value={onChainValue} prefix="$" colorize onClick={() => setTab('positions')} detail="CTF positions on Polygon" />
+                <MetricCard label="Total Redeemed" value={totalRedeemed} prefix="$" onClick={() => setTab('redemptions')} detail="All-time redemptions" />
                 <MetricCard label="Win Rate" value={a.winRate * 100} suffix="%" />
-                <MetricCard label="Total Trades" value={trades.length} onClick={() => setTab('trades')} detail="Click to browse" />
+                <MetricCard label="Matched Trades" value={trades.filter((t:any) => t.status === 'matched' || t.status === 'filled' || t.status === 'delayed').length} onClick={() => setTab('trades')} detail={`${trades.filter((t:any) => t.status === 'FAILED').length} failed`} />
               </div>
 
               {/* Charts */}
@@ -324,8 +358,8 @@ export default function App() {
                     <thead><tr className="text-[10px] uppercase tracking-wider text-gray-500 border-b border-[#1e293b]">
                       <th className="text-left py-2 px-2 sm:px-3">Team</th><th className="text-left py-2 px-2 sm:px-3 hidden md:table-cell">Game</th>
                       <th className="text-right py-2 px-2 sm:px-3">Shares</th><th className="text-right py-2 px-2 sm:px-3">Avg</th>
-                      <th className="text-right py-2 px-2 sm:px-3">Cost</th><th className="text-right py-2 px-2 sm:px-3">P&L</th>
-                      <th className="text-right py-2 px-2 sm:px-3">Links</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Cost</th><th className="text-right py-2 px-2 sm:px-3">On-Chain</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Status</th><th className="text-right py-2 px-2 sm:px-3">Links</th>
                     </tr></thead>
                     <tbody>{positions.map((p: any, i: number) => {
                       const meta = parseMeta(p.meta);
@@ -340,7 +374,20 @@ export default function App() {
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">{fmt(p.size, 0)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(p.avg_price)}</td>
                           <td className="py-2.5 px-2 sm:px-3 text-right font-mono">${fmt(cost)}</td>
-                          <td className={`py-2.5 px-2 sm:px-3 text-right font-bold font-mono ${pnlColor(upnl)}`}>{fmtUsd(upnl)}</td>
+                          <td className="py-2.5 px-2 sm:px-3 text-right font-mono">
+                            {p.on_chain_tokens != null ? (
+                              <span className={p.on_chain_tokens > 0 ? 'text-emerald-400' : 'text-red-400'}>
+                                {fmt(p.on_chain_tokens, 1)}
+                              </span>
+                            ) : <span className="text-gray-600">—</span>}
+                          </td>
+                          <td className="py-2.5 px-2 sm:px-3 text-right">
+                            {p.on_chain_tokens != null ? (
+                              p.on_chain_tokens > 0
+                                ? <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">✓ Verified</span>
+                                : <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-400">✗ Not on-chain</span>
+                            ) : <span className="text-[10px] text-gray-600">checking…</span>}
+                          </td>
                           <td className="py-2.5 px-2 sm:px-3 text-right space-x-1.5">
                             <a href={pmLink(p.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
                             <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">Wallet ↗</a>
