@@ -163,9 +163,9 @@ function EquityBreakdown({ data, onClose }: { data: DashboardData; onClose: () =
 
         <div className="space-y-2 text-sm">
           <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold pt-1">Current Holdings</div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Wallet USDC.e</span><span className="font-mono">${fmt(walletUsdc)}</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">On-Chain Token Value</span><span className="font-mono text-blue-400">${fmt(onChainTokenValue)}</span></div>
-          <div className="flex justify-between py-2 border-b border-[#1e293b] font-bold text-base"><span>Verified Equity</span><span className="text-emerald-400">${fmt(equity)}</span></div>
+          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer"><span className="text-gray-400">Wallet USDC.e ↗</span><span className="font-mono">${fmt(walletUsdc)}</span></a>
+          <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer"><span className="text-gray-400">On-Chain Token Value ↗</span><span className="font-mono text-blue-400">${fmt(onChainTokenValue)}</span></a>
+          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer font-bold text-base"><span>Verified Equity ↗</span><span className="text-emerald-400">${fmt(equity)}</span></a>
 
           <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold pt-3">On-Chain Flow (All Time)</div>
           <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Deposited ({oc?.deposits?.length ?? 0} TXs)</span><span className="font-mono">${fmt(totalDeposited)}</span></div>
@@ -332,7 +332,7 @@ export default function App() {
                 <MetricCard label="Net P&L" value={netPnl} prefix={netPnl >= 0 ? '+$' : '-$'} colorize onClick={() => setShowBreakdown(true)} detail={`Deposited: $${fmt(totalDeposited)}`} />
                 <MetricCard label="Token Value" value={onChainValue} prefix="$" onClick={() => setTab('positions')} detail="CTF positions on Polygon" />
                 <MetricCard label="Redeemed" value={totalRedeemed} prefix="$" onClick={() => setShowBreakdown(true)} detail={`${oc?.redemptions?.length ?? 0} on-chain TXs`} />
-                <MetricCard label="Wallet USDC" value={walletUsdc} prefix="$" detail="On-chain balance" />
+                <MetricCard label="Wallet USDC" value={walletUsdc} prefix="$" detail="On-chain balance" onClick={() => window.open(`https://polygonscan.com/address/${WALLET}`, '_blank')} />
                 <MetricCard label="Matched Trades" value={ts.matched} onClick={() => setTab('trades')} detail={`${ts.failed} failed of ${ts.total}`} />
               </div>
 
