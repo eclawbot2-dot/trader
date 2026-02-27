@@ -1,22 +1,18 @@
-import { useEffect, useMemo } from 'react'
-import { Layout } from './components/layout/Layout'
-import { Header } from './components/layout/Header'
-import { PortfolioCards } from './components/dashboard/PortfolioCards'
-import { EquityCurve } from './components/dashboard/EquityCurve'
-import { PositionsTable } from './components/dashboard/PositionsTable'
-import { TradeFeed } from './components/dashboard/TradeFeed'
-import { AnalyticsPanel } from './components/dashboard/AnalyticsPanel'
-import { PnlBreakdown } from './components/dashboard/PnlBreakdown'
-import { EdgeDistribution } from './components/dashboard/EdgeDistribution'
-import { DrawdownChart } from './components/dashboard/DrawdownChart'
-import { AlertsPanel } from './components/dashboard/AlertsPanel'
-import { RedemptionsTable } from './components/dashboard/RedemptionsTable'
-import { SkeletonLoader } from './components/common/SkeletonLoader'
+import { useEffect } from 'react'
+import { AlertsPanel } from './components/AlertsPanel'
+import { AnalyticsPanel } from './components/AnalyticsPanel'
+import { EquityCurve } from './components/EquityCurve'
+import { Header } from './components/Header'
+import { Layout } from './components/Layout'
+import { PortfolioCards } from './components/PortfolioCards'
+import { PositionsTable } from './components/PositionsTable'
+import { RedemptionsTable } from './components/RedemptionsTable'
+import { TradeFeed } from './components/TradeFeed'
 import { useDashboard } from './hooks/useDashboard'
 import { useWebSocket } from './hooks/useWebSocket'
 
 export default function App() {
-  const { loading, lastUpdate, dashboard, balance, alerts, setAlerts, loadSnapshot, onSocketMessage, pnlBreakdown, edgeHistogram } = useDashboard()
+  const { loading, dashboard, balance, alerts, setAlerts, loadSnapshot, onSocketMessage } = useDashboard()
   const status = useWebSocket(onSocketMessage)
 
   useEffect(() => {
@@ -27,51 +23,39 @@ export default function App() {
 
   const pnl = dashboard.analytics.pnl || { realized: 0, unrealized: 0, total: 0 }
   const roi = dashboard.analytics.roi ?? 0
-
-  const kellyStats = useMemo(() => {
-    const kelly = dashboard.trades.map((t) => Number(t.kelly || 0))
-    const avg = kelly.length ? kelly.reduce((a, b) => a + b, 0) / kelly.length : 0
-    const max = kelly.length ? Math.max(...kelly) : 0
-    return { avg, max }
-  }, [dashboard.trades])
+  const equity = balance.equity || pnl.total + balance.usdc
 
   return (
     <Layout>
-      <Header status={status} wallet={undefined} usdc={balance.usdc} lastUpdate={lastUpdate} />
+      <Header status={status} wallet={undefined} usdc={balance.usdc} />
 
       {loading ? (
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {Array.from({ length: 6 }).map((_, i) => <SkeletonLoader key={i} className="h-32" />)}
-          </div>
-          <SkeletonLoader className="h-96" />
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-3 xl:grid-cols-6">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="h-28 animate-pulse rounded-xl border border-[#1e293b] bg-[#111827]" />
+          ))}
         </div>
       ) : (
         <>
           <PortfolioCards
-            equity={balance.equity || 1000 + pnl.total}
+            equity={equity}
             usdc={balance.usdc}
+            roi={roi}
             realized={pnl.realized}
             unrealized={pnl.unrealized}
-            roi={roi}
             trades={dashboard.trades.length}
           />
 
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+          <section className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <EquityCurve data={dashboard.equityCurve} />
-            <AnalyticsPanel analytics={dashboard.analytics} kellyAvg={kellyStats.avg} kellyMax={kellyStats.max} />
+            <AnalyticsPanel analytics={dashboard.analytics} />
 
             <PositionsTable positions={dashboard.positions} />
+            <TradeFeed trades={dashboard.trades} />
             <AlertsPanel alerts={alerts} onDismiss={(index) => setAlerts((prev) => prev.filter((_, i) => i !== index))} />
 
-            <TradeFeed trades={dashboard.trades} />
-            <PnlBreakdown title="P&L by Sport" data={pnlBreakdown.sport} />
-            <PnlBreakdown title="P&L by League" data={pnlBreakdown.league} />
-            <EdgeDistribution data={edgeHistogram} />
-            <DrawdownChart data={dashboard.drawdownSeries} />
-
             <RedemptionsTable rows={dashboard.redemptions} />
-          </div>
+          </section>
         </>
       )}
     </Layout>
