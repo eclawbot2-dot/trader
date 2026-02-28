@@ -11,7 +11,7 @@ export const config = {
     id: 137,
     rpc: process.env.ALCHEMY_RPC ?? '',
     privateKey: process.env.PRIVATE_KEY ?? '',
-    wallet: '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe',
+    wallet: '0xb23093047d9a95fAF117e333F82624317EBfd433',
     contracts: {
       USDC_E: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
       CTF: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
@@ -28,6 +28,7 @@ export const config = {
     predictionApiKey: process.env.PREDICTIONDATA_API_KEY ?? '',
   },
   risk: {
+    mode: (process.env.TRADING_MODE ?? 'edge').toLowerCase(),
     edgeThreshold: Number(process.env.EDGE_THRESHOLD ?? 0.02),
     kellyFraction: Number(process.env.KELLY_FRACTION ?? 0.5),
     maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 50),

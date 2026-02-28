@@ -11,7 +11,8 @@
     "dev:frontend": "npm --prefix frontend run dev",
     "build:frontend": "npm --prefix frontend run build",
     "dev:backend": "NODE_TLS_REJECT_UNAUTHORIZED=0 tsx watch src/index.ts",
-    "build:all": "npm run build && npm run build:frontend"
+    "build:all": "npm run build && npm run build:frontend",
+    "destination:approve": "node scripts/approve-destination.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",

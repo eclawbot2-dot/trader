@@ -1,6 +1,12 @@
 import { Express } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import { getAddress } from 'ethers';
 import { Db } from '../db/queries.js';
 import { AnalyticsEngine } from '../analytics/engine.js';
+import { config } from '../config.js';
+import { bus } from '../notifications/emitter.js';
+import { loadApprovedDestinations } from '../security/wallet-guard.js';
 
 function parseJson(input: unknown): Record<string, unknown> {
   if (!input) return {};
@@ -12,7 +18,7 @@ function parseJson(input: unknown): Record<string, unknown> {
   }
 }
 
-const WALLET = '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe';
+const WALLET = config.chain.wallet;
 const CTF_CONTRACT = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const CLOB_EXCHANGE = '0x4bfb41d5'; // Polymarket CLOB exchange (prefix)
@@ -35,9 +41,11 @@ async function alchemyTransfers(direction: 'to' | 'from'): Promise<any[]> {
 }
 
 interface OnChainSummary {
+  wallet: string;
   walletUsdc: number; pol: number;
   totalDeposited: number; deposits: { hash: string; amount: number; from: string }[];
   totalRedeemed: number; redemptions: { hash: string; amount: number }[];
+  withdrawals: { hash: string; to: string; asset: string; amount: number; approved: boolean }[];
   totalClobReturns: number;
   totalSpentOnTrades: number;
   positions: any[];
@@ -81,7 +89,16 @@ async function getFullOnChainData(dbPositions: any[]): Promise<OnChainSummary> {
     }
   }
 
-  // 3. Total spent on trades (outgoing USDC.e)
+  // 3. Outgoing transfers / withdrawals
+  const approvedSet = new Set(loadApprovedDestinations().map((d) => d.address.toLowerCase()));
+  const withdrawals = outgoing.map((tx: any) => ({
+    hash: tx.hash,
+    to: tx.to,
+    asset: tx.asset || 'UNKNOWN',
+    amount: Number(tx.value || 0),
+    approved: approvedSet.has(String(tx.to || '').toLowerCase()),
+  }));
+
   let totalSpentOnTrades = 0;
   for (const tx of outgoing.filter((t: any) => t.asset === 'USDCE')) {
     totalSpentOnTrades += tx.value || 0;
@@ -100,13 +117,39 @@ async function getFullOnChainData(dbPositions: any[]): Promise<OnChainSummary> {
   const netPnl = (equity + totalRedeemed + totalClobReturns) - totalDeposited;
 
   return {
-    walletUsdc, pol, totalDeposited, deposits, totalRedeemed, redemptions,
+    wallet: WALLET,
+    walletUsdc, pol, totalDeposited, deposits, totalRedeemed, redemptions, withdrawals,
     totalClobReturns, totalSpentOnTrades, positions, totalTokenValue,
     equity, netPnl, ts: Date.now(),
   };
 }
 
 export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine): void {
+  // Live monitoring state from feed events
+  const marketState = new Map<string, { marketId: string; outcome: string; price?: number; probability?: number; hasPrice: boolean; hasModel: boolean; league?: string; team?: string; lastSeen: number }>();
+  let listenersAttached = false;
+  if (!listenersAttached) {
+    listenersAttached = true;
+    bus.on('market:price', (p: any) => {
+      const key = `${p.marketId}:${p.outcome}`;
+      const prev = marketState.get(key) ?? { marketId: String(p.marketId), outcome: String(p.outcome), hasPrice: false, hasModel: false, lastSeen: Date.now() };
+      prev.price = Number(p.price);
+      prev.hasPrice = true;
+      prev.lastSeen = Date.now();
+      marketState.set(key, prev);
+    });
+    bus.on('market:model', (m: any) => {
+      const key = `${m.marketId}:${m.outcome}`;
+      const prev = marketState.get(key) ?? { marketId: String(m.marketId), outcome: String(m.outcome), hasPrice: false, hasModel: false, lastSeen: Date.now() };
+      prev.probability = Number(m.probability);
+      prev.hasModel = true;
+      prev.league = m.league;
+      prev.team = m.team;
+      prev.lastSeen = Date.now();
+      marketState.set(key, prev);
+    });
+  }
+
   app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
   app.get('/positions', (_req, res) => res.json(db.listPositions()));
   app.get('/trades', (req, res) => res.json(db.listTrades(Number(req.query.limit ?? 200))));
@@ -148,6 +191,37 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
     if (data) res.json(data); else res.status(500).json({ error: 'Failed to fetch on-chain data' });
   });
 
+  app.post('/approve-destination', (req, res) => {
+    try {
+      const address = getAddress(String(req.body?.address || ''));
+      const label = String(req.body?.label || 'manual');
+      const approvedBy = String(req.body?.approvedBy || 'unknown');
+      const ticket = String(req.body?.ticket || 'no-ticket');
+      const confirmPhrase = String(req.body?.confirmPhrase || '');
+      if (confirmPhrase !== 'I_AM_HUMAN') return res.status(400).json({ ok: false, error: 'human confirmation phrase required' });
+
+      const file = path.resolve(process.cwd(), 'config/approved-destinations.json');
+      const data = fs.existsSync(file)
+        ? JSON.parse(fs.readFileSync(file, 'utf8'))
+        : { version: 1, destinations: [] as any[] };
+
+      const exists = (data.destinations || []).some((d: any) => String(d.address).toLowerCase() === address.toLowerCase());
+      if (!exists) {
+        data.destinations.push({
+          address,
+          label,
+          approvedBy,
+          approvedAt: new Date().toISOString(),
+          ticket,
+        });
+        fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
+      }
+      res.json({ ok: true, address, exists });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
   app.get('/dashboard', async (_req, res) => {
     const positions = db.listPositions() as any[];
     const trades = db.listTrades(250) as any[];
@@ -181,11 +255,32 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
     const failedCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side FROM trades WHERE status = 'FAILED')").get() as any)?.c || 0;
     const totalUniqueCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side, price, size, edge, status FROM trades)").get() as any)?.c || 0;
 
+    const now = Date.now();
+    const activeGames = [...marketState.values()]
+      // Keep a wider recency window so feed diagnostics are visible even during short stream gaps.
+      .filter((m) => now - m.lastSeen < 30 * 60 * 1000)
+      .map((m) => ({
+        marketId: m.marketId,
+        outcome: m.outcome,
+        league: m.league ?? null,
+        team: m.team ?? null,
+        price: m.price ?? null,
+        probability: m.probability ?? null,
+        hasPrice: m.hasPrice,
+        hasModel: m.hasModel,
+        edge: m.price != null && m.probability != null ? (m.probability - m.price) : null,
+        eligible: m.price != null && m.probability != null && (m.probability - m.price) >= config.risk.edgeThreshold,
+        lastSeen: m.lastSeen,
+      }))
+      .sort((a, b) => b.lastSeen - a.lastSeen)
+      .slice(0, 200);
+
     res.json({
       positions: enrichedPositions,
       trades,
       // On-chain verified financial data
       onChain: onChain ? {
+        wallet: onChain.wallet,
         walletUsdc: onChain.walletUsdc,
         pol: onChain.pol,
         totalDeposited: onChain.totalDeposited,
@@ -197,9 +292,27 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
         netPnl: onChain.netPnl,
         deposits: onChain.deposits,
         redemptions: onChain.redemptions,
+        withdrawals: onChain.withdrawals,
         ts: onChain.ts,
       } : null,
       tradeStats: { matched: matchedCount, failed: failedCount, total: totalUniqueCount },
+      monitoring: {
+        criteria: {
+          mode: config.risk.mode,
+          edgeThreshold: config.risk.edgeThreshold,
+          kellyFraction: config.risk.kellyFraction,
+          maxTradeUsd: config.risk.maxTradeUsd,
+          maxExposureUsd: config.risk.maxExposureUsd,
+          drawdownAlert: config.risk.drawdownAlert,
+        },
+        feedStats: {
+          total: activeGames.length,
+          priceFeed: activeGames.filter((g) => g.hasPrice).length,
+          modelFeed: activeGames.filter((g) => g.hasModel).length,
+          intersected: activeGames.filter((g) => g.hasPrice && g.hasModel).length,
+        },
+        activeGames,
+      },
       equityCurve: db.getTimeSeries('equity', 1000),
       drawdownSeries: db.getTimeSeries('drawdown', 1000),
       edgeObservations,

@@ -11,6 +11,7 @@ import { WalletService } from './chain/wallet.js';
 import { ChainMonitor } from './chain/monitor.js';
 import { AnalyticsEngine } from './analytics/engine.js';
 import { startApi } from './api/server.js';
+import { assertFundingWalletIsEoa } from './security/wallet-guard.js';
 async function main() {
     const db = new Db(config.db.path);
     const analytics = new AnalyticsEngine(db);
@@ -18,10 +19,15 @@ async function main() {
     const wallet = new WalletService();
     const chain = new ChainMonitor();
     const prediction = new PredictionDataStream();
+    // Hard safety gate: funding wallet must be an EOA (never contract wallet)
+    await assertFundingWalletIsEoa(wallet.provider, wallet.wallet.address);
     const polymarket = new PolymarketWs();
     new EdgeEngine();
     wireTelegramNotifications();
-    bus.on('edge:signal', (signal) => executor.execute(signal));
+    // Arb-only mode: block edge trades entirely unless mode explicitly set to edge.
+    if (config.risk.mode === 'edge') {
+        bus.on('edge:signal', (signal) => executor.execute(signal));
+    }
     bus.on('chain:marketResolved', (r) => {
         const pos = db.db.prepare('SELECT * FROM positions WHERE market_id=? AND resolved=0').all(r.marketId);
         for (const p of pos) {

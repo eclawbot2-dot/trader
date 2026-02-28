@@ -4,15 +4,17 @@ import { motion, AnimatePresence } from 'framer-motion';
 
 // ─── Types ──────────────────────────────────────────────────────
 interface OnChainData {
+  wallet: string;
   walletUsdc: number; pol: number; totalDeposited: number; totalRedeemed: number;
   totalClobReturns: number; totalSpentOnTrades: number; totalTokenValue: number;
   equity: number; netPnl: number;
   deposits: { hash: string; amount: number; from: string }[];
   redemptions: { hash: string; amount: number }[];
+  withdrawals: { hash: string; to: string; asset: string; amount: number; approved: boolean }[];
   ts: number;
 }
 interface TradeStats { matched: number; failed: number; total: number; }
-interface DashboardData { positions: any[]; trades: any[]; equityCurve: any[]; drawdownSeries: any[]; edgeObservations: any[]; onChain: OnChainData | null; tradeStats: TradeStats; }
+interface DashboardData { positions: any[]; trades: any[]; equityCurve: any[]; drawdownSeries: any[]; edgeObservations: any[]; onChain: OnChainData | null; tradeStats: TradeStats; monitoring?: { criteria: any; feedStats?: any; activeGames: any[] }; }
 
 // ─── EST Formatters ─────────────────────────────────────────────
 const estOpts: Intl.DateTimeFormatOptions = { timeZone: 'America/New_York' };
@@ -35,7 +37,7 @@ const fmtSmartDate = (ts: number) => {
 
 const truncAddr = (a: string) => a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '';
 const pnlColor = (v: number) => v > 0 ? 'text-emerald-400' : v < 0 ? 'text-red-400' : 'text-gray-400';
-const WALLET = '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe';
+const DEFAULT_WALLET = '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe';
 const CTF = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const isRealTxHash = (h: string | null) => h && h.length >= 64; // real tx hashes are 66 chars (0x + 64 hex)
 // Server-side slug resolver → redirects to polymarket.com/event/<slug>
@@ -122,6 +124,7 @@ function EdgeChart({ trades }: { trades: any[] }) {
 function EquityBreakdown({ data, onClose }: { data: DashboardData; onClose: () => void }) {
   const positions = data.positions || [];
   const oc = data.onChain;
+  const activeWallet = oc?.wallet || DEFAULT_WALLET;
   const tStats = data.tradeStats || { matched: 0, failed: 0, total: 0 };
   const walletUsdc = oc?.walletUsdc ?? 0;
   const onChainTokenValue = oc?.totalTokenValue ?? 0;
@@ -163,9 +166,9 @@ function EquityBreakdown({ data, onClose }: { data: DashboardData; onClose: () =
 
         <div className="space-y-2 text-sm">
           <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold pt-1">Current Holdings</div>
-          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer"><span className="text-gray-400">Wallet USDC.e ↗</span><span className="font-mono">${fmt(walletUsdc)}</span></a>
-          <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer"><span className="text-gray-400">On-Chain Token Value ↗</span><span className="font-mono text-blue-400">${fmt(onChainTokenValue)}</span></a>
-          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer font-bold text-base"><span>Verified Equity ↗</span><span className="text-emerald-400">${fmt(equity)}</span></a>
+          <a href={`https://polygonscan.com/address/${activeWallet}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer"><span className="text-gray-400">Wallet USDC.e ↗</span><span className="font-mono">${fmt(walletUsdc)}</span></a>
+          <a href={`https://polygonscan.com/token/${CTF}?a=${activeWallet}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer"><span className="text-gray-400">On-Chain Token Value ↗</span><span className="font-mono text-blue-400">${fmt(onChainTokenValue)}</span></a>
+          <a href={`https://polygonscan.com/address/${activeWallet}`} target="_blank" rel="noreferrer" className="flex justify-between py-2 border-b border-[#1e293b] hover:bg-[#1a2332] rounded px-1 -mx-1 cursor-pointer font-bold text-base"><span>Verified Equity ↗</span><span className="text-emerald-400">${fmt(equity)}</span></a>
 
           <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold pt-3">On-Chain Flow (All Time)</div>
           <div className="flex justify-between py-2 border-b border-[#1e293b]"><span className="text-gray-400">Deposited ({oc?.deposits?.length ?? 0} TXs)</span><span className="font-mono">${fmt(totalDeposited)}</span></div>
@@ -225,8 +228,8 @@ function EquityBreakdown({ data, onClose }: { data: DashboardData; onClose: () =
         </div>
 
         <div className="mt-4 flex justify-center gap-4">
-          <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">Wallet ↗</a>
-          <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">CTF Tokens ↗</a>
+          <a href={`https://polygonscan.com/address/${activeWallet}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">Wallet ↗</a>
+          <a href={`https://polygonscan.com/token/${CTF}?a=${activeWallet}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-xs underline">CTF Tokens ↗</a>
         </div>
       </motion.div>
     </motion.div>
@@ -238,13 +241,39 @@ export default function App() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [connected, setConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
-  const [tab, setTab] = useState<'dashboard' | 'positions' | 'trades' | 'failed-trades' | 'redemptions'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'positions' | 'trades' | 'failed-trades' | 'redemptions' | 'monitoring'>('dashboard');
   const [showBreakdown, setShowBreakdown] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   const fetchData = useCallback(async () => {
     try { const res = await fetch('/dashboard'); setData(await res.json()); setLastUpdate(new Date()); } catch {}
   }, []);
+
+  const approveDestination = useCallback(async (address: string) => {
+    const approvedBy = window.prompt('Approved by (human name):');
+    if (!approvedBy) return;
+    const ticket = window.prompt('Approval ticket / reason:');
+    if (!ticket) return;
+
+    const res = await fetch('/approve-destination', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        address,
+        label: 'dashboard-approval',
+        approvedBy,
+        ticket,
+        confirmPhrase: 'I_AM_HUMAN',
+      }),
+    });
+
+    const j = await res.json();
+    if (!res.ok || !j.ok) {
+      window.alert(`Approval failed: ${j.error || 'unknown error'}`);
+      return;
+    }
+    await fetchData();
+  }, [fetchData]);
 
   useEffect(() => { fetchData(); const iv = setInterval(fetchData, 15000); return () => clearInterval(iv); }, [fetchData]);
 
@@ -267,6 +296,7 @@ export default function App() {
   const positions = data.positions || [];
   const trades = data.trades || [];
   const oc = data.onChain;
+  const activeWallet = oc?.wallet || DEFAULT_WALLET;
   const ts = data.tradeStats || { matched: 0, failed: 0, total: 0 };
   // ALL financial numbers from on-chain Polygon RPC
   const equity = oc?.equity ?? 0;
@@ -277,6 +307,9 @@ export default function App() {
   const netPnl = oc?.netPnl ?? 0;
   const totalSpent = oc?.totalSpentOnTrades ?? 0;
   const clobReturns = oc?.totalClobReturns ?? 0;
+  const criteria = data.monitoring?.criteria || {};
+  const feedStats = data.monitoring?.feedStats || { total: 0, priceFeed: 0, modelFeed: 0, intersected: 0 };
+  const activeGames = data.monitoring?.activeGames || [];
 
   const successTrades = trades.filter((t: any) => t.status === 'matched' || t.status === 'filled');
   const failedTrades = trades.filter((t: any) => t.status !== 'matched' && t.status !== 'filled');
@@ -286,6 +319,7 @@ export default function App() {
     { id: 'trades' as const, label: `✅ Trades (${successTrades.length})` },
     { id: 'failed-trades' as const, label: `❌ Failed (${failedTrades.length})` },
     { id: 'redemptions' as const, label: `💰 Redemptions (${oc?.redemptions?.length ?? 0})` },
+    { id: 'monitoring' as const, label: `🎯 Monitoring (${data.monitoring?.activeGames?.length ?? 0})` },
   ];
 
   return (
@@ -302,9 +336,9 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3 text-[11px] text-gray-500">
             <span>{lastUpdate.toLocaleTimeString('en-US', estOpts)} EST</span>
-            <a href={`https://polygonscan.com/address/${WALLET}`} target="_blank" rel="noreferrer"
+            <a href={`https://polygonscan.com/address/${activeWallet}`} target="_blank" rel="noreferrer"
               className="font-mono bg-[#111827] px-2 py-1 rounded text-gray-400 hover:text-blue-400 transition-colors hidden sm:inline">
-              {truncAddr(WALLET)}
+              {truncAddr(activeWallet)}
             </a>
           </div>
         </div>
@@ -335,7 +369,7 @@ export default function App() {
                 <MetricCard label="Net P&L" value={netPnl} prefix={netPnl >= 0 ? '+$' : '-$'} colorize onClick={() => setShowBreakdown(true)} detail={`Deposited: $${fmt(totalDeposited)}`} />
                 <MetricCard label="Token Value" value={onChainValue} prefix="$" onClick={() => setTab('positions')} detail="CTF positions on Polygon" />
                 <MetricCard label="Redeemed" value={totalRedeemed} prefix="$" onClick={() => setShowBreakdown(true)} detail={`${oc?.redemptions?.length ?? 0} on-chain TXs`} />
-                <MetricCard label="Wallet USDC" value={walletUsdc} prefix="$" detail="On-chain balance" onClick={() => window.open(`https://polygonscan.com/address/${WALLET}`, '_blank')} />
+                <MetricCard label="Wallet USDC" value={walletUsdc} prefix="$" detail="On-chain balance" onClick={() => window.open(`https://polygonscan.com/address/${activeWallet}`, '_blank')} />
                 <MetricCard label="Matched Trades" value={ts.matched} onClick={() => setTab('trades')} detail={`${ts.failed} failed of ${ts.total}`} />
               </div>
 
@@ -358,7 +392,7 @@ export default function App() {
                 <MetricCard label="CLOB Returns" value={clobReturns} prefix="$" detail="Cancelled/returned orders" />
                 <MetricCard label="ROI" value={totalDeposited > 0 ? (netPnl / totalDeposited) * 100 : 0} suffix="%" colorize />
                 <MetricCard label="Open Positions" value={positions.filter((p: any) => p.on_chain_tokens > 0).length} onClick={() => setTab('positions')} detail={`${positions.length} in DB`} />
-                <MetricCard label="On-Chain TXs" value={(oc?.deposits?.length ?? 0) + (oc?.redemptions?.length ?? 0)} detail="Deposits + redemptions verified" onClick={() => window.open(`https://polygonscan.com/address/${WALLET}`, '_blank')} />
+                <MetricCard label="On-Chain TXs" value={(oc?.deposits?.length ?? 0) + (oc?.redemptions?.length ?? 0)} detail="Deposits + redemptions verified" onClick={() => window.open(`https://polygonscan.com/address/${activeWallet}`, '_blank')} />
               </div>
 
               {/* Recent Trades Preview */}
@@ -430,7 +464,7 @@ export default function App() {
                           </td>
                           <td className="py-2.5 px-2 sm:px-3 text-right space-x-1.5">
                             <a href={pmLink(p.market_id)} target="_blank" rel="noreferrer" className="text-purple-400 hover:text-purple-300 text-[10px] underline">Market ↗</a>
-                            <a href={`https://polygonscan.com/token/${CTF}?a=${WALLET}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">Wallet ↗</a>
+                            <a href={`https://polygonscan.com/token/${CTF}?a=${activeWallet}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">Wallet ↗</a>
                           </td>
                         </tr>
                       );
@@ -584,6 +618,103 @@ export default function App() {
                       </tr>
                     ))}</tbody>
                   </table>
+                </div>
+              </div>
+
+              <div className="bg-[#111827] border border-[#1e293b] rounded-xl p-4 sm:p-5 mt-4">
+                <h3 className="text-sm font-semibold text-gray-300 mb-3">📤 Withdrawals / Outgoing ({oc?.withdrawals?.length ?? 0})</h3>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs sm:text-sm">
+                    <thead><tr className="text-[10px] uppercase tracking-wider text-gray-500 border-b border-[#1e293b]">
+                      <th className="text-left py-2 px-2 sm:px-3">TX Hash</th>
+                      <th className="text-left py-2 px-2 sm:px-3">To</th>
+                      <th className="text-left py-2 px-2 sm:px-3">Asset</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Amount</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Approved</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Action</th>
+                    </tr></thead>
+                    <tbody>{(oc?.withdrawals || []).map((w: any, i: number) => (
+                      <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors">
+                        <td className="py-2.5 px-2 sm:px-3 font-mono text-[11px] text-gray-400">{w.hash.slice(0, 20)}…</td>
+                        <td className="py-2.5 px-2 sm:px-3 font-mono text-[11px] text-gray-500">{w.to?.slice(0, 10)}…</td>
+                        <td className="py-2.5 px-2 sm:px-3 text-gray-300">{w.asset}</td>
+                        <td className="py-2.5 px-2 sm:px-3 text-right font-mono">{fmt(w.amount)}</td>
+                        <td className="py-2.5 px-2 sm:px-3 text-right">{w.approved ? <span className="text-emerald-400">Yes</span> : <span className="text-yellow-400">No</span>}</td>
+                        <td className="py-2.5 px-2 sm:px-3 text-right space-x-2">
+                          <a href={`https://polygonscan.com/tx/${w.hash}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300 text-[10px] underline">TX ↗</a>
+                          {!w.approved && (
+                            <button onClick={() => approveDestination(w.to)} className="text-[10px] px-2 py-1 rounded bg-emerald-600/30 text-emerald-300 hover:bg-emerald-600/50">Approve</button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {/* ═══ MONITORING TAB ═══ */}
+          {tab === 'monitoring' && (
+            <motion.div key="monitoring" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-4">
+              <div className="bg-[#111827] border border-[#1e293b] rounded-xl p-4 sm:p-5">
+                <h3 className="text-sm font-semibold text-gray-300 mb-3">⚙️ Current Trading Criteria</h3>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3 text-xs">
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Mode</div><div className="font-mono">{criteria.mode ?? 'edge'}</div></div>
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Max Trade USD</div><div className="font-mono">${criteria.maxTradeUsd ?? 'n/a'}</div></div>
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Max Exposure USD</div><div className="font-mono">${criteria.maxExposureUsd ?? 'n/a'}</div></div>
+                  {criteria.mode !== 'arb' && (
+                    <>
+                      <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Edge Threshold</div><div className="font-mono">{criteria.edgeThreshold ?? 'n/a'}</div></div>
+                      <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Kelly Fraction</div><div className="font-mono">{criteria.kellyFraction ?? 'n/a'}</div></div>
+                      <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Drawdown Alert</div><div className="font-mono">{criteria.drawdownAlert ?? 'n/a'}</div></div>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="bg-[#111827] border border-[#1e293b] rounded-xl p-4 sm:p-5">
+                {/* Feed Health is intentionally explicit so ops can quickly identify which upstream feed is degraded. */}
+                <h3 className="text-sm font-semibold text-gray-300 mb-3">📡 Feed Health</h3>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 text-xs mb-4">
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Total Rows</div><div className="font-mono">{feedStats.total}</div></div>
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Price Feed</div><div className="font-mono">{feedStats.priceFeed}</div></div>
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Model Feed</div><div className="font-mono">{feedStats.modelFeed}</div></div>
+                  <div className="bg-[#0f172a] rounded-lg p-3"><div className="text-gray-500">Intersected</div><div className="font-mono">{feedStats.intersected}</div></div>
+                </div>
+                <h3 className="text-sm font-semibold text-gray-300 mb-3">🎯 Active Games/Markets Being Monitored ({activeGames.length})</h3>
+                <div className="overflow-x-auto max-h-[70vh] overflow-y-auto">
+                  <table className="w-full text-xs sm:text-sm">
+                    <thead className="sticky top-0 bg-[#111827] z-10"><tr className="text-[10px] uppercase tracking-wider text-gray-500 border-b border-[#1e293b]">
+                      <th className="text-left py-2 px-2 sm:px-3">Market ID</th>
+                      <th className="text-left py-2 px-2 sm:px-3">Outcome</th>
+                      <th className="text-left py-2 px-2 sm:px-3">League</th>
+                      <th className="text-left py-2 px-2 sm:px-3">Team</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Price</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Model Prob</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Price Feed</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Model Feed</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Edge</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Eligible</th>
+                      <th className="text-right py-2 px-2 sm:px-3">Seen</th>
+                    </tr></thead>
+                    <tbody>{activeGames.map((g: any, i: number) => (
+                      <tr key={i} className="border-b border-[#1e293b]/50 hover:bg-[#1a2332] transition-colors">
+                        <td className="py-2 px-2 sm:px-3 font-mono text-[11px]">{String(g.marketId).slice(0, 14)}…</td>
+                        <td className="py-2 px-2 sm:px-3">{g.outcome ?? ''}</td>
+                        <td className="py-2 px-2 sm:px-3 text-gray-400">{g.league ?? '-'}</td>
+                        <td className="py-2 px-2 sm:px-3 text-gray-400">{g.team ?? '-'}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right font-mono">{g.price != null ? fmt(g.price, 3) : '-'}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right font-mono">{g.probability != null ? fmt(g.probability, 3) : '-'}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right">{g.hasPrice ? <span className="text-emerald-400">Yes</span> : <span className="text-red-400">No</span>}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right">{g.hasModel ? <span className="text-emerald-400">Yes</span> : <span className="text-red-400">No</span>}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right font-mono text-blue-400">{g.edge != null ? fmt(g.edge, 3) : '-'}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right">{g.eligible ? <span className="text-emerald-400">Yes</span> : <span className="text-gray-500">No</span>}</td>
+                        <td className="py-2 px-2 sm:px-3 text-right text-gray-400 font-mono text-[11px]">{fmtSmartDate(g.lastSeen)}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                  {!activeGames.length && <div className="text-gray-600 text-center py-8 italic">No active market feed rows yet</div>}
                 </div>
               </div>
             </motion.div>

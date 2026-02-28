@@ -58,4 +58,6 @@ npm run start
 
 ## Notes
 - Contract addresses, wallet, and chain config are in `src/config.ts` per legacy references.
-- Trade execution module currently performs deterministic simulated fills and records all events in DB. Integration point for live order signing/submission is `src/chain/executor.ts`.
+- Outgoing fund destinations are locked by human-approved allowlist in `config/approved-destinations.json`.
+- To add a destination, run (human approval required):
+  `npm run destination:approve -- --address <0x...> --label <name> --approved-by <human> --ticket <id> --confirm I_AM_HUMAN`

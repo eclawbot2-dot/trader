@@ -5,8 +5,69 @@ import { retry } from '../utils/retry.js';
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? '0';
 export class PredictionDataStream {
     abort;
+    pollTimer;
+    emitFromPayload(payload) {
+        let emitted = 0;
+        // Schema A: { markets: [{ fixture_id, side, odds, league, ... }] }
+        const marketRows = payload?.markets;
+        if (Array.isArray(marketRows)) {
+            for (const m of marketRows) {
+                const marketId = String(m.fixture_id ?? m.market_id ?? m.id ?? '');
+                const odds = Number(m.odds ?? 0);
+                const prob = odds > 0 ? 1 / odds : 0;
+                if (!marketId || !Number.isFinite(prob) || prob <= 0 || prob >= 1)
+                    continue;
+                bus.emit('market:model', {
+                    marketId,
+                    outcome: String(m.side ?? m.team_id ?? m.team ?? '0'),
+                    probability: prob,
+                    league: m.league,
+                    team: m.side,
+                    ts: Date.now(),
+                });
+                emitted++;
+            }
+            return emitted;
+        }
+        // Schema B: legacy stream shape with outcomes array
+        const marketId = String(payload?.market_id ?? payload?.id ?? payload?.marketId ?? '');
+        const outcomes = payload?.outcomes ?? [];
+        if (marketId && Array.isArray(outcomes)) {
+            for (const o of outcomes) {
+                const prob = Number(o.probability ?? o.model_probability ?? o.implied_probability ?? 0);
+                if (!Number.isFinite(prob) || prob <= 0 || prob >= 1)
+                    continue;
+                bus.emit('market:model', {
+                    marketId,
+                    outcome: String(o.name ?? o.outcome ?? o.id ?? '0'),
+                    probability: prob,
+                    league: payload?.league,
+                    team: payload?.team,
+                    ts: Date.now(),
+                });
+                emitted++;
+            }
+        }
+        return emitted;
+    }
+    async restFallbackPoll() {
+        try {
+            const url = `${config.market.predictionRest}?league=NCAAB&bet_types=moneyline&periods=FT&book_ids=250`;
+            const res = await fetch(url, { headers: { 'X-API-KEY': config.market.predictionApiKey } });
+            if (!res.ok)
+                return;
+            const data = await res.json();
+            this.emitFromPayload(data);
+        }
+        catch {
+            // ignore fallback errors
+        }
+    }
     async start() {
         this.abort = new AbortController();
+        // Self-heal fallback: poll REST every 30s even if SSE is quiet
+        this.pollTimer = setInterval(() => { void this.restFallbackPoll(); }, 30000);
+        void this.restFallbackPoll();
         await retry(async () => {
             const res = await fetch(config.market.predictionSse, {
                 headers: { 'X-API-KEY': config.market.predictionApiKey, Accept: 'text/event-stream' },
@@ -31,18 +92,7 @@ export class PredictionDataStream {
                     const payload = line.replace(/^data:\s*/, '');
                     try {
                         const msg = JSON.parse(payload);
-                        const marketId = String(msg.market_id ?? msg.id ?? msg.marketId ?? '');
-                        const outcomes = msg.outcomes ?? [];
-                        for (const o of outcomes) {
-                            bus.emit('market:model', {
-                                marketId,
-                                outcome: String(o.name ?? o.outcome ?? o.id ?? '0'),
-                                probability: Number(o.probability ?? o.model_probability ?? 0),
-                                league: msg.league,
-                                team: msg.team,
-                                ts: Date.now(),
-                            });
-                        }
+                        this.emitFromPayload(msg);
                     }
                     catch {
                         // ignore malformed
@@ -53,5 +103,7 @@ export class PredictionDataStream {
     }
     stop() {
         this.abort?.abort();
+        if (this.pollTimer)
+            clearInterval(this.pollTimer);
     }
 }
