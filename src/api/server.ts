@@ -9,6 +9,7 @@ import { Db } from '../db/queries.js';
 import { AnalyticsEngine } from '../analytics/engine.js';
 import { registerRoutes } from './routes.js';
 import { attachWs } from './ws-handler.js';
+import type { FeedWatchdog } from '../utils/feed-watchdog.js';
 
 function resolveFrontendDistDir(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
@@ -25,13 +26,13 @@ function resolveFrontendDistDir(): string {
   return path.resolve(process.cwd(), 'frontend/dist');
 }
 
-const API_PREFIXES = ['/health', '/positions', '/trades', '/balance', '/pnl', '/analytics', '/dashboard', '/ws'];
+const API_PREFIXES = ['/health', '/positions', '/trades', '/balance', '/pnl', '/analytics', '/dashboard', '/ws', '/on-chain', '/pm', '/approve-destination'];
 
-export function startApi(db: Db, analytics: AnalyticsEngine): { app: express.Express; server: Server } {
+export function startApi(db: Db, analytics: AnalyticsEngine, watchdog?: FeedWatchdog): { app: express.Express; server: Server } {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  registerRoutes(app, db, analytics);
+  registerRoutes(app, db, analytics, watchdog);
 
   if (process.env.NODE_ENV === 'production') {
     const frontendDistDir = resolveFrontendDistDir();

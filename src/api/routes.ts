@@ -6,7 +6,8 @@ import { Db } from '../db/queries.js';
 import { AnalyticsEngine } from '../analytics/engine.js';
 import { config } from '../config.js';
 import { bus } from '../notifications/emitter.js';
-import { loadApprovedDestinations } from '../security/wallet-guard.js';
+import { loadApprovedDestinations, invalidateDestinationCache } from '../security/wallet-guard.js';
+import type { FeedWatchdog } from '../utils/feed-watchdog.js';
 
 function parseJson(input: unknown): Record<string, unknown> {
   if (!input) return {};
@@ -124,7 +125,7 @@ async function getFullOnChainData(dbPositions: any[]): Promise<OnChainSummary> {
   };
 }
 
-export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine): void {
+export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine, watchdog?: FeedWatchdog): void {
   // Live monitoring state from feed events
   const marketState = new Map<string, { marketId: string; outcome: string; price?: number; probability?: number; hasPrice: boolean; hasModel: boolean; league?: string; team?: string; lastSeen: number }>();
   let listenersAttached = false;
@@ -150,7 +151,12 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
     });
   }
 
-  app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+  app.get('/health', (_req, res) => {
+    const feeds = watchdog?.snapshot() ?? {};
+    const allHealthy = Object.values(feeds).every((f) => f.healthy);
+    const status = allHealthy ? 200 : 503;
+    res.status(status).json({ ok: allHealthy, ts: Date.now(), uptime: process.uptime(), feeds });
+  });
   app.get('/positions', (_req, res) => res.json(db.listPositions()));
   app.get('/trades', (req, res) => res.json(db.listTrades(Number(req.query.limit ?? 200))));
   app.get('/balance', (_req, res) => res.json(db.latestBalance() ?? { usdc: 0, exposure: 0, equity: 0 }));
@@ -215,6 +221,7 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
           ticket,
         });
         fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
+        invalidateDestinationCache();
       }
       res.json({ ok: true, address, exists });
     } catch (e) {
@@ -250,10 +257,10 @@ export function registerRoutes(app: Express, db: Db, analytics: AnalyticsEngine)
       .prepare('SELECT ts, market_id, outcome, edge, settled, correct FROM edge_observations ORDER BY ts DESC LIMIT 800')
       .all();
 
-    // Deduplicated trade stats — migration duplicated all v1 trades
-    const matchedCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side FROM trades WHERE status IN ('matched','filled','delayed'))").get() as any)?.c || 0;
-    const failedCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side FROM trades WHERE status = 'FAILED')").get() as any)?.c || 0;
-    const totalUniqueCount = (db.db.prepare("SELECT COUNT(*) as c FROM (SELECT DISTINCT ts, market_id, outcome, side, price, size, edge, status FROM trades)").get() as any)?.c || 0;
+    // Trade stats — duplicates already cleaned at startup by dedup migration
+    const matchedCount = (db.db.prepare("SELECT COUNT(*) as c FROM trades WHERE status IN ('matched','MATCHED','filled','delayed','SIMULATED_FILLED')").get() as any)?.c || 0;
+    const failedCount = (db.db.prepare("SELECT COUNT(*) as c FROM trades WHERE status = 'FAILED'").get() as any)?.c || 0;
+    const totalUniqueCount = (db.db.prepare("SELECT COUNT(*) as c FROM trades").get() as any)?.c || 0;
 
     const now = Date.now();
     const activeGames = [...marketState.values()]

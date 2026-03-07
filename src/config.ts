@@ -11,7 +11,7 @@ export const config = {
     id: 137,
     rpc: process.env.ALCHEMY_RPC ?? '',
     privateKey: process.env.PRIVATE_KEY ?? '',
-    wallet: '0xb23093047d9a95fAF117e333F82624317EBfd433',
+    wallet: '0xA74C6d8B96acba2372E85967Fb82EAa948A7AdFe',
     contracts: {
       USDC_E: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
       CTF: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',

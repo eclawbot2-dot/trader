@@ -2,12 +2,16 @@ import { config } from '../config.js';
 import { bus } from '../notifications/emitter.js';
 import { logger } from '../utils/logger.js';
 import { retry } from '../utils/retry.js';
+import { CircuitBreaker } from '../utils/circuit-breaker.js';
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? '0';
+// NOTE: TLS bypass for PredictionData self-signed cert is set process-wide in index.ts
+// via start script flag. Removed from here to avoid disabling TLS for all outgoing requests.
 
 export class PredictionDataStream {
   private abort?: AbortController;
   private pollTimer?: NodeJS.Timeout;
+  private readonly breaker = new CircuitBreaker(10, 60_000);
+  public lastEventTs = 0; // exposed for feed watchdog
 
   private emitFromPayload(payload: any): number {
     let emitted = 0;
@@ -56,14 +60,26 @@ export class PredictionDataStream {
   }
 
   private async restFallbackPoll(): Promise<void> {
+    if (!this.breaker.canExecute()) {
+      logger.warn({ state: this.breaker.state() }, 'PredictionData circuit breaker OPEN — skipping REST poll');
+      return;
+    }
     try {
       const url = `${config.market.predictionRest}?league=NCAAB&bet_types=moneyline&periods=FT&book_ids=250`;
       const res = await fetch(url, { headers: { 'X-API-KEY': config.market.predictionApiKey } });
-      if (!res.ok) return;
+      if (!res.ok) {
+        this.breaker.onFailure();
+        return;
+      }
       const data: any = await res.json();
-      this.emitFromPayload(data);
-    } catch {
-      // ignore fallback errors
+      const emitted = this.emitFromPayload(data);
+      if (emitted > 0) {
+        this.breaker.onSuccess();
+        this.lastEventTs = Date.now();
+      }
+    } catch (e) {
+      this.breaker.onFailure();
+      logger.warn({ err: String(e) }, 'PredictionData REST poll error');
     }
   }
 
@@ -95,13 +111,14 @@ export class PredictionDataStream {
           const payload = line.replace(/^data:\s*/, '');
           try {
             const msg = JSON.parse(payload);
-            this.emitFromPayload(msg);
+            const emitted = this.emitFromPayload(msg);
+            if (emitted > 0) this.lastEventTs = Date.now();
           } catch {
             // ignore malformed
           }
         }
       }
-    }, { attempts: 100, baseMs: 1000, maxMs: 30000, onError: (e) => logger.error({ err: e.message }, 'PredictionData reconnect') });
+    }, { attempts: Infinity, baseMs: 1000, maxMs: 30000, onError: (e) => logger.error({ err: e.message }, 'PredictionData reconnect') });
   }
 
   stop(): void {
@@ -109,3 +126,5 @@ export class PredictionDataStream {
     if (this.pollTimer) clearInterval(this.pollTimer);
   }
 }
+
+

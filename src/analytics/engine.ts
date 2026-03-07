@@ -4,6 +4,7 @@ import { sharpe, maxDrawdown } from './metrics.js';
 import { TimeSeriesStore } from './timeseries.js';
 import { AlertEngine } from './alerts.js';
 import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
 
 export class AnalyticsEngine {
   private readonly ts: TimeSeriesStore;
@@ -29,8 +30,10 @@ export class AnalyticsEngine {
       const pos = this.db.db.prepare('SELECT * FROM positions WHERE market_id=? AND outcome=?').get(marketId, outcome) as any;
       if (!pos || pos.size === 0) return;
       const pnl = (price - pos.avg_price) * pos.size;
-      this.unrealized += pnl - (pos.unrealized_pnl ?? 0);
+      // Update position in DB
       this.db.upsertPosition({ ...pos, marketId, outcome, size: pos.size, avgPrice: pos.avg_price, lastPrice: price, unrealizedPnl: pnl, realizedPnl: pos.realized_pnl ?? 0, resolved: pos.resolved, winner: pos.winner });
+      // Recompute total unrealized from DB to avoid additive drift
+      this.recomputeUnrealized();
       this.update();
     });
 
@@ -40,14 +43,21 @@ export class AnalyticsEngine {
     });
   }
 
+  /** Recompute total unrealized P&L from DB source of truth (no additive drift) */
+  private recomputeUnrealized(): void {
+    const row = this.db.db.prepare('SELECT COALESCE(SUM(unrealized_pnl),0) as total FROM positions WHERE resolved=0').get() as any;
+    this.unrealized = row?.total ?? 0;
+  }
+
   private bootstrap(): void {
     // Load historical trades to compute realized P&L, wins, losses
+    // Edge is stored as decimal (e.g. 0.05 = 5%), same as live path uses (edge * size)
     const trades = this.db.db.prepare('SELECT * FROM trades ORDER BY ts ASC').all() as any[];
     for (const t of trades) {
       const edge = t.edge ?? 0;
       const size = t.size ?? 0;
       if (t.status === 'matched' || t.status === 'MATCHED' || t.status === 'filled' || t.status === 'delayed') {
-        this.realized += edge / 100 * size; // edge is percentage
+        this.realized += edge * size; // edge is decimal, consistent with live path
         if (edge > 0) this.wins++; else this.losses++;
         const equity = 1000 + this.realized + this.unrealized;
         this.equityCurve.push(equity);
@@ -57,11 +67,8 @@ export class AnalyticsEngine {
       }
     }
 
-    // Load positions for unrealized P&L
-    const positions = this.db.db.prepare('SELECT * FROM positions WHERE resolved=0').all() as any[];
-    for (const p of positions) {
-      this.unrealized += (p.unrealized_pnl ?? 0);
-    }
+    // Load positions for unrealized P&L — single source of truth from DB
+    this.recomputeUnrealized();
 
     // Load redemptions into realized
     const redemptions = this.db.db.prepare('SELECT SUM(amount) as total FROM redemptions').get() as any;
@@ -69,7 +76,7 @@ export class AnalyticsEngine {
       // Already accounted in trades, just note it
     }
 
-    console.log(`Analytics bootstrapped: ${trades.length} trades, ${this.wins}W/${this.losses}L, realized=$${this.realized.toFixed(2)}, unrealized=$${this.unrealized.toFixed(2)}`);
+    logger.info({ trades: trades.length, wins: this.wins, losses: this.losses, realized: this.realized, unrealized: this.unrealized }, 'analytics bootstrapped');
   }
 
   private update(): void {

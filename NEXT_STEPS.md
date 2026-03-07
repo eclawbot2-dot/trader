@@ -1,52 +1,47 @@
 # NEXT STEPS (Dev-Facing)
 
-Last updated: 2026-02-28
+Last updated: 2026-03-07
 
-## A. Fix Polymarket subscription/data mapping (P0)
-1. Confirm exact subscription payload required by current CLOB WS endpoint.
-2. Subscribe using explicit token/asset IDs (empty lists may not produce events).
-3. Add parser coverage for actual event variants received in production (`book`, `price_change`, `best_bid_ask`, `last_trade_price`).
-4. Emit normalized `market:price` events only when marketId + price are valid.
+## Completed (2026-03-07 code review fixes)
 
-**Definition of done:**
-- `feedStats.priceFeed > 0`
-- `feedStats.intersected > 0` under normal traffic
+1. ✅ **Polymarket WS subscription** — fetches active token IDs from CLOB REST, subscribes in batches, auto-refreshes 5min
+2. ✅ **EdgeEngine live bankroll** — pulls wallet USDC balance (60s cache) instead of hardcoded $1000
+3. ✅ **Analytics edge scaling** — fixed `edge / 100 * size` → `edge * size` (decimal, matches live path)
+4. ✅ **Unrealized P&L drift** — recomputes from DB on each tick instead of additive delta
+5. ✅ **Trade deduplication** — one-time migration at startup removes dupes, simplified listTrades query
+6. ✅ **Circuit breaker wired** — TradeExecutor (5/30s) + PredictionData REST (10/60s)
+7. ✅ **Exposure limit** — TradeExecutor checks maxExposureUsd before executing, alerts on rejection
+8. ✅ **Feed watchdog** — 120s grace, 30s check interval, fires risk:alert + Telegram on stale feeds
+9. ✅ **Destination cache** — loadApprovedDestinations cached 30s, invalidated on new approvals
+10. ✅ **/health endpoint** — returns feed liveness, uptime, 503 when degraded
+11. ✅ **console.log → logger.info** in analytics bootstrap
+12. ✅ **TLS scope** — removed module-level process.env override from predictiondata.ts (handled by start script)
 
-## B. Add strict runtime self-heal + alerting (P0)
-1. Add feed liveness watchdog with grace period (e.g., 60-120s after boot).
-2. If no price events in window:
-   - mark health RED in API
-   - auto retry alt subscription strategy
-   - send operator alert to chat with root cause
-3. Record last event timestamps per feed in dashboard payload.
+## Remaining
 
-## C. Improve AI handoff quality (P1)
-1. Keep `HANDOFF_FOR_NEXT_AI.md` updated per major fix.
-2. Include:
-   - what changed
-   - what is still broken
-   - exact verification command snippets
-
-## D. Bundle optimization (P2)
+### A. Bundle optimization (P2)
 1. Split large monitoring/dashboard code paths with dynamic imports.
 2. Configure `manualChunks` for vendor-heavy dependencies.
-3. Re-check build size and startup latency.
 
-## E. Ops hygiene (P2)
+### B. Ops hygiene (P2)
 1. Reserve/standardize local service ports.
 2. Add startup check that logs port conflicts clearly before full boot.
+
+### C. Chain monitor investigation (P2)
+1. Investigate why Alchemy WSS kills process.
+2. Consider polling-based alternative or different WebSocket provider.
 
 ---
 
 ## Quick verification commands
 
 ```bash
+# Health with feed status
+curl -s http://127.0.0.1:8080/health | jq .
+
 # Dashboard feed stats
-curl -s http://127.0.0.1:3100/dashboard | jq '.monitoring.feedStats'
+curl -s http://127.0.0.1:8080/dashboard | jq '.monitoring.feedStats'
 
-# Health
-curl -s http://127.0.0.1:3100/health
-
-# Tail runtime log
-tail -f /tmp/pe2.log
+# Standalone health server
+curl -s http://127.0.0.1:8081 | jq .
 ```
